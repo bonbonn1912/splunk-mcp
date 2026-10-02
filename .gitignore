@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+.gemini/settings.json

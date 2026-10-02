@@ -1,0 +1,29 @@
+{
+  "name": "splunk-mcp",
+  "version": "0.1.0",
+  "description": "Read-only MCP server for self-hosted Splunk Enterprise, built for Gemini CLI",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "splunk-mcp": "dist/cli.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
