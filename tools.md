@@ -4,7 +4,7 @@ MCP-Server in TypeScript für **selbst gehostetes Splunk Enterprise**, primär f
 Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, Rückgaben, Splunk-Endpunkte und Sicherheitsregeln.
 
 - Prosa: Deutsch. Tool-Namen, Parameter und `description`-Strings: Englisch (die liest das Modell).
-- Status: v1.0, implementiert in `src/`. Noch nicht gegen eine echte Splunk-Instanz erprobt.
+- Status: v1.1, implementiert in `src/`. Noch nicht gegen eine echte Splunk-Instanz erprobt.
 - Zielversion: Splunk Enterprise 10.2.x (v2-Search-Endpunkte, kein v1-Fallback).
 
 ---
@@ -16,7 +16,9 @@ Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, 
 | Sprache / Runtime | TypeScript, Node.js ≥ 20, ESM |
 | SDK | `@modelcontextprotocol/sdk`, Schemas mit `zod` |
 | Transport | **stdio** (Standard für Gemini CLI). Streamable HTTP optional später |
-| Splunk-Zugriff | **REST-API über den Management-Port `8089`** (mit AD-Konto per Basic Auth geprüft). Splunk Web `8443` nur für Links und als Ausweichweg, siehe 1.8. Immer `output_mode=json` |
+| Splunk-Zugriff | **Eine** Splunk-Instanz, REST-API über den Management-Port `8089`. Splunk Web `8443` nur für Links. Immer `output_mode=json` |
+| Umgebungen | TEST, TEST2, INT1 … sind **Host-Filter** auf dieser einen Instanz, siehe 1.6 |
+| Gesperrte Hosts | Der PROD-Host darf nie in Ergebnissen auftauchen. Mehrstufiger Schutz, siehe 4.1 |
 | Authentifizierung | Benutzer + verschlüsselt abgelegtes Passwort (siehe 1.5); einmaliger Login, danach Session-Key. Bearer-Token optional |
 | TLS | Self-signed Zertifikate per Fingerprint-Pinning (Standard), siehe 1.7. Unverschlüsseltes HTTP nur mit explizitem Flag |
 | Modus | **Ausschließlich read-only**. Es gibt keine schreibenden Tools |
@@ -25,38 +27,41 @@ Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, 
 
 | Variable | Pflicht | Default | Bedeutung |
 |---|---|---|---|
-| `SPLUNK_URL_<NAME>` | ja (mind. eine) | – | Eine Variable je Umgebung, z. B. `SPLUNK_URL_INT1=https://splunk-int1.example.lan:8089`. Siehe 1.6 |
-| `SPLUNK_WEB_PORT` | nein | `8443` | Port von Splunk Web, für `meta.web_url`. Abweichender Host per `SPLUNK_WEB_URL_<NAME>` |
-| `SPLUNK_LOCALE` | nein | `de-DE` | Sprachpräfix im Splunk-Web-Pfad |
-| `SPLUNK_REQUEST_TIMEOUT_MS` | nein | `60000` | Zeitlimit je HTTP-Anfrage an Splunk |
-| `SPLUNK_DEBUG` | nein | `false` | Protokolliert jeden Splunk-Aufruf auf stderr |
-| `SPLUNK_SOURCETYPE_<NAME>` | nein | – | Standard-Sourcetype der Umgebung. Siehe 1.9 |
-| `SPLUNK_HOST_<NAME>` | nein | – | Standard-Host der Umgebung; Wildcard (`shop-*`) oder Kommaliste möglich |
-| `SPLUNK_INDEX_<NAME>` | nein | – | Standard-Index der Umgebung, falls nötig |
-| `SPLUNK_EXCLUDE_ACTUATOR` | nein | `false` | `true` blendet Spring-Boot-Actuator-Aufrufe (`/actuator…`) aus jeder Suche aus. Siehe 1.10 |
-| `SPLUNK_ACTUATOR_FIELD` | nein | – | Feld mit dem Request-Pfad (z. B. `uri`); ohne Angabe Filter auf den Rohtext |
-| `SPLUNK_EXCLUDE_TERMS` | nein | – | Weitere auszublendende Begriffe/Pfade, kommagetrennt |
+| `SPLUNK_URL` | ja | – | Management-Port der Splunk-Instanz, z. B. `https://splunk.example.lan:8089` |
+| `SPLUNK_HOST_<NAME>` | ja (mind. eine) | – | Legt die Umgebung `<NAME>` an und nennt ihre Hosts, z. B. `SPLUNK_HOST_INT1=inthost01`. Kommaliste und Wildcard (`int-*`) möglich |
+| `SPLUNK_BLOCKED_HOSTS` | **ja** | – | Hosts, deren Daten nie ausgegeben werden dürfen (PROD). Kommaliste, Wildcard möglich. Ohne diese Angabe startet der Server nicht |
 | `SPLUNK_USERNAME` | ja* | – | Splunk- bzw. AD-Benutzername |
 | `SPLUNK_PASSWORD_ENC` | ja* | – | Verschlüsseltes Passwort, Format siehe 1.5 |
 | `SPLUNK_SECRET` | ja* | – | Zufälliger 32-Byte-Schlüssel (Base64) zum Entschlüsseln |
 | `SPLUNK_TOKEN` | nein | – | Alternative: Authentication Token, falls später freigeschaltet |
-| `SPLUNK_CA_CERT` | nein | – | Pfad zu PEM-Datei der internen CA, nur für `verify` |
 | `SPLUNK_TLS_MODE` | nein | `pinned` | `pinned` \| `verify` \| `insecure`, siehe 1.7 |
-| `SPLUNK_TLS_FINGERPRINT_<NAME>` | bei `pinned` | – | SHA-256-Fingerprint des Server-Zertifikats der Umgebung |
-| `SPLUNK_ALLOW_HTTP` | nein | `false` | Erlaubt `http://`-URLs (Passwort geht dann unverschlüsselt übers Netz) |
-| `SPLUNK_APP` | nein | `search` | App-Name (`…/app/<app>/search`), zugleich App-Kontext für die API. Je Umgebung per `SPLUNK_APP_<NAME>` |
+| `SPLUNK_TLS_FINGERPRINT` | bei `pinned` | – | SHA-256-Fingerprint des Server-Zertifikats |
+| `SPLUNK_CA_CERT` | nein | – | Pfad zu PEM-Datei der internen CA, nur für `verify` |
+| `SPLUNK_ALLOW_HTTP` | nein | `false` | Erlaubt eine `http://`-URL (Passwort geht dann unverschlüsselt übers Netz) |
+| `SPLUNK_APP` | nein | `search` | App-Name (`…/app/<app>/search`), zugleich App-Kontext für die API |
+| `SPLUNK_SOURCETYPE` | nein | – | Standard-Sourcetype für alle Umgebungen |
+| `SPLUNK_INDEX` | nein | – | Standard-Index, falls nötig |
+| `SPLUNK_EXCLUDE_ACTUATOR` | nein | `false` | `true` blendet Spring-Boot-Actuator-Aufrufe (`/actuator…`) aus jeder Suche aus. Siehe 1.10 |
+| `SPLUNK_ACTUATOR_FIELD` | nein | – | Feld mit dem Request-Pfad (z. B. `uri`); ohne Angabe Filter auf den Rohtext |
+| `SPLUNK_EXCLUDE_TERMS` | nein | – | Weitere auszublendende Begriffe/Pfade, kommagetrennt |
+| `SPLUNK_ALLOWED_INDEXES` | nein | – | Kommagetrennte Allowlist; leer = alle laut Rolle |
+| `SPLUNK_ENABLE_KVSTORE` | nein | `false` | Schaltet `splunk_query_kvstore` frei. Standardmäßig aus, weil KV-Store-Inhalte keinem Host zugeordnet sind |
+| `SPLUNK_WEB_PORT` | nein | `8443` | Port von Splunk Web, für `meta.web_url`. Abweichende Adresse per `SPLUNK_WEB_URL` |
+| `SPLUNK_LOCALE` | nein | `de-DE` | Sprachpräfix im Splunk-Web-Pfad |
 | `SPLUNK_DEFAULT_EARLIEST` | nein | `-24h` | Zeitfenster, wenn das Modell keines angibt |
 | `SPLUNK_MAX_ROWS` | nein | `1000` | Harte Obergrenze für Ergebniszeilen pro Aufruf |
 | `SPLUNK_MAX_OUTPUT_CHARS` | nein | `40000` | Harte Obergrenze für die Antwortgröße |
 | `SPLUNK_SEARCH_TIMEOUT_S` | nein | `120` | Max. Wartezeit für `splunk_search` |
-| `SPLUNK_ALLOWED_INDEXES` | nein | – | Kommagetrennte Allowlist; leer = alle laut Rolle |
-| `SPLUNK_ALLOW_RISKY_SPL` | nein | `false` | Erlaubt riskante SPL-Kommandos (siehe 4.1) |
+| `SPLUNK_REQUEST_TIMEOUT_MS` | nein | `60000` | Zeitlimit je HTTP-Anfrage an Splunk |
+| `SPLUNK_DEBUG` | nein | `false` | Protokolliert jeden Splunk-Aufruf auf stderr |
 
 \* Entfällt, wenn `SPLUNK_TOKEN` gesetzt ist. Ein Klartext-`SPLUNK_PASSWORD` wird bewusst **nicht** unterstützt.
 
+Je Umgebung überschreibbar (Suffix `_<NAME>`): `SPLUNK_APP`, `SPLUNK_SOURCETYPE`, `SPLUNK_INDEX`, `SPLUNK_ALLOWED_INDEXES`, `SPLUNK_EXCLUDE_ACTUATOR`, `SPLUNK_ACTUATOR_FIELD`, `SPLUNK_EXCLUDE_TERMS`.
+
 ### 1.2 Gemini-CLI-Einbindung
 
-`~/.gemini/settings.json` (oder `.gemini/settings.json` im Projekt):
+`~/.gemini/settings.json`:
 
 ```json
 {
@@ -65,22 +70,24 @@ Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, 
       "command": "node",
       "args": ["/pfad/zu/splunk-mcp/dist/cli.js"],
       "env": {
-        "SPLUNK_URL_TEST": "https://splunk-test.example.lan:8089",
-        "SPLUNK_URL_TEST2": "https://splunk-test2.example.lan:8089",
-        "SPLUNK_URL_INT1": "https://splunk-int1.example.lan:8089",
-        "SPLUNK_URL_INT2": "https://splunk-int2.example.lan:8089",
-        "SPLUNK_URL_DEMO": "https://splunk-demo.example.lan:8089",
+        "SPLUNK_URL": "https://splunk.example.lan:8089",
+        "SPLUNK_TLS_FINGERPRINT": "AB:CD:…",
+
         "SPLUNK_USERNAME": "dein.benutzer",
         "SPLUNK_PASSWORD_ENC": "v1:…:…:…",
         "SPLUNK_SECRET": "…44 Zeichen Base64…",
+
         "SPLUNK_APP": "meine_app",
+        "SPLUNK_SOURCETYPE": "mein:sourcetype",
         "SPLUNK_EXCLUDE_ACTUATOR": "true",
-        "SPLUNK_SOURCETYPE_TEST": "mein:sourcetype",
+
         "SPLUNK_HOST_TEST": "testhost01",
-        "SPLUNK_SOURCETYPE_INT1": "mein:sourcetype",
+        "SPLUNK_HOST_TEST2": "testhost02",
         "SPLUNK_HOST_INT1": "inthost01",
-        "SPLUNK_TLS_FINGERPRINT_TEST": "AB:CD:…",
-        "SPLUNK_TLS_FINGERPRINT_INT1": "12:34:…"
+        "SPLUNK_HOST_INT2": "inthost02",
+        "SPLUNK_HOST_DEMO": "demohost01",
+
+        "SPLUNK_BLOCKED_HOSTS": "prodhost01"
       },
       "timeout": 180000,
       "trust": false
@@ -147,56 +154,56 @@ Das Passwort steht nie im Klartext in der `settings.json`. Abgelegt werden zwei 
 
 ### 1.6 Umgebungen
 
-Ein Server-Prozess bedient mehrere Splunk-Umgebungen. Vorgesehen sind zunächst **TEST, TEST2, INT1, INT2, DEMO**. PROD ist bewusst nicht konfiguriert.
+Es gibt **eine** Splunk-Instanz. Eine Umgebung ist nichts anderes als ein fester Host-Filter darauf.
 
-- **Definition:** Jede Variable `SPLUNK_URL_<NAME>` legt eine Umgebung `<NAME>` an (Großbuchstaben, Ziffern). Eine weitere Umgebung ist nur eine weitere Zeile in der `settings.json`, kein Code.
-- **Zugangsdaten:** `SPLUNK_USERNAME`, `SPLUNK_PASSWORD_ENC` und `SPLUNK_SECRET` gelten für alle Umgebungen.
-- **Auswahl:** Jedes Tool hat den Pflichtparameter `environment` (String-Enum, zur Laufzeit aus den konfigurierten Namen gebaut). Es gibt **keinen Default und keinen gemerkten Zustand**: Nennt der Benutzer keine Umgebung, muss Gemini nachfragen. So landet nie eine Suche versehentlich auf der falschen Umgebung.
-- **Eingabe:** Der Name muss exakt einem konfigurierten Wert entsprechen (Großbuchstaben); das Schema gibt die gültigen Werte als Enum vor.
-- **Sessions:** Login erfolgt je Umgebung erst beim ersten Aufruf; der Session-Key wird pro Umgebung im Speicher gehalten.
-- **Lockout-Schutz:** Da überall dasselbe AD-Passwort gilt, sperrt ein `AUTH_FAILED` in einer Umgebung alle weiteren Login-Versuche in **allen** Umgebungen bis zum Neustart des Servers.
-- **Job-IDs:** Eine `sid` gilt nur in der Umgebung, in der sie erzeugt wurde. Jede Antwort trägt `meta.environment`.
-- **Abweichungen je Umgebung (optional):** `SPLUNK_APP_<NAME>`, `SPLUNK_ALLOWED_INDEXES_<NAME>`, `SPLUNK_EXCLUDE_ACTUATOR_<NAME>`, `SPLUNK_TLS_MODE_<NAME>`, `SPLUNK_CA_CERT_<NAME>` überschreiben den globalen Wert.
-- **PROD später:** Kommt als `SPLUNK_URL_PROD` hinzu; empfohlen dann mit engeren Limits über die `_PROD`-Varianten.
+- **Definition:** Jede Variable `SPLUNK_HOST_<NAME>` legt eine Umgebung an (Name aus Großbuchstaben und Ziffern). Der Wert nennt den oder die Hosts: einzelner Name, Kommaliste oder Wildcard.
+- **Auswahl:** Jedes Tool hat den Pflichtparameter `environment` (String-Enum aus den konfigurierten Namen). Es gibt keinen Default und keinen gemerkten Zustand: Nennt der Benutzer keine Umgebung, muss Gemini nachfragen.
+- **Wirkung:** Jede Suche bekommt zwingend `host=<Hosts der Umgebung>` vorangestellt. Das lässt sich pro Aufruf **nicht** überschreiben oder abschalten.
+- **Gemeinsam für alle Umgebungen:** URL, Zertifikat, Zugangsdaten, Sourcetype. Es gibt nur eine Anmeldung und eine Session.
+- **Job-IDs:** Eine `sid` gilt nur in der Umgebung und Sitzung, die sie erzeugt hat. Jede Antwort trägt `meta.environment`.
+- **PROD:** Wird nicht als Umgebung angelegt. Der PROD-Host steht in `SPLUNK_BLOCKED_HOSTS`. Überschneidet sich ein Umgebungs-Host mit einem gesperrten Host, startet der Server nicht.
 
 ### 1.7 TLS bei self-signed oder fehlendem Zertifikat
 
-Splunk liefert den Management-Port 8089 standardmäßig mit TLS und einem selbst signierten Zertifikat aus. Der Server unterstützt drei Modi, global oder je Umgebung (`SPLUNK_TLS_MODE_<NAME>`):
+Splunk liefert den Management-Port 8089 standardmäßig mit TLS und einem selbst signierten Zertifikat aus. Der Server unterstützt drei Modi (`SPLUNK_TLS_MODE`):
 
 | Modus | Verhalten | Wann |
 |---|---|---|
 | `pinned` (Default) | Keine CA-Prüfung, aber das Zertifikat muss exakt den hinterlegten SHA-256-Fingerprint haben | Self-signed Zertifikate |
 | `verify` | Normale Prüfung gegen System-CAs bzw. `SPLUNK_CA_CERT` | Zertifikat von interner CA |
-| `insecure` | Keine Prüfung | Nur als Notlösung; Warnung auf stderr bei jedem Start |
+| `insecure` | Keine Prüfung | Nur als Notlösung; Warnung auf stderr |
 
-- **Fingerprint holen:** `node dist/cli.js fingerprint <NAME>` verbindet sich einmal, zeigt Aussteller, Gültigkeit und Fingerprint und gibt die fertige Zeile für die `settings.json` aus.
+- **Fingerprint holen:** `node dist/cli.js fingerprint https://<host>:8089` verbindet sich einmal, zeigt Aussteller, Gültigkeit und Fingerprint und gibt die fertige Zeile für die `settings.json` aus.
 - **Zertifikat geändert:** Fehler `TLS_FINGERPRINT_MISMATCH`; es wird **kein** Login gesendet. Fingerprint neu holen und eintragen.
-- **Gar kein TLS (`http://`):** Nur mit `SPLUNK_ALLOW_HTTP=true`. Login und Session-Key gehen dann lesbar übers Netz. Da es das AD-Passwort ist, sollte das nur in einem vertrauenswürdigen Netz oder über VPN genutzt werden; besser TLS auf 8089 wieder einschalten (`enableSplunkdSSL = true` in `server.conf`).
+- **Gar kein TLS (`http://`):** Nur mit `SPLUNK_ALLOW_HTTP=true`. Login und Session-Key gehen dann lesbar übers Netz.
 - Der Modus wirkt nur auf die Verbindungen dieses Servers (eigener `https.Agent`); `NODE_TLS_REJECT_UNAUTHORIZED` wird nicht angefasst.
 
 ### 1.8 Zugriff: Management-Port 8089, Splunk Web 8443
 
-**Standard:** Der Server spricht die REST-API direkt auf `https://<host>:8089` an. Das AD-Konto wird dort akzeptiert (geprüft mit `/services/authentication/current-context`). Alle Endpunkte aus Abschnitt 3 gelten unverändert.
+Der Server spricht die REST-API direkt auf `SPLUNK_URL` (Port 8089) an. Splunk Web (8443) wird nur für Links genutzt: Jede Suchantwort enthält `meta.web_url`, also `https://<host>:8443/{locale}/app/<app>/search?q=…&earliest=…&latest=…`, mit dem sich dieselbe Suche (inklusive Host-Filter) im Browser öffnen lässt.
 
-**Splunk Web (8443)** wird im Standard nur für Links genutzt: Jede Suchantwort enthält `meta.web_url`, also `https://<host>:8443/{locale}/app/<app>/search?q=…&earliest=…&latest=…`, mit dem sich dieselbe Suche im Browser öffnen lässt. Host kommt aus `SPLUNK_URL_<NAME>`, Port aus `SPLUNK_WEB_PORT`.
+### 1.9 Aufbau jeder Suche
 
-**Ausweichweg über Splunk Web (nicht implementiert):** Falls 8089 in einer Umgebung nicht erreichbar ist, kann die API über Splunk Web laufen: Login über `/{locale}/account/login` (Cookie `cval`, danach Session- und CSRF-Cookie), Aufrufe unter `/{locale}/splunkd/__raw/…` mit `X-Requested-With: XMLHttpRequest` und bei `POST` `X-Splunk-Form-Key`. Ungetestet, funktioniert nicht mit SSO, und einzelne Endpunkte können gesperrt sein (`NOT_EXPOSED`). Wird nur gebaut, wenn eine Umgebung es erfordert.
+Das Modell schreibt nur Suchbegriffe und die Pipeline. Der Server baut daraus:
 
-### 1.9 Standard-Suchbereich je Umgebung
+```text
+search [index=…] [sourcetype=…] host=<Umgebung> NOT host=<gesperrt> [NOT "/actuator"] ( <Suchbegriffe des Modells> ) | <Pipeline des Modells>
+```
 
-Suchen haben hier typischerweise die Form `search sourcetype=<…> host=<…> …`. Sourcetype und Host sind je Umgebung konfigurierbar (`SPLUNK_SOURCETYPE_<NAME>`, `SPLUNK_HOST_<NAME>`, optional `SPLUNK_INDEX_<NAME>`).
+| Teil | Herkunft | Abschaltbar? |
+|---|---|---|
+| `index=` | `SPLUNK_INDEX`, falls gesetzt | entfällt, wenn die Suche selbst `index=` nennt |
+| `sourcetype=` | `SPLUNK_SOURCETYPE` | Parameter `sourcetype` ersetzt ihn; entfällt, wenn die Suche selbst `sourcetype=` nennt |
+| `host=` | `SPLUNK_HOST_<NAME>` | **nein** |
+| `NOT host=` | `SPLUNK_BLOCKED_HOSTS` | **nein** |
+| Ausschlussfilter | 1.10 | Parameter `include_excluded=true` |
 
-- **Anwendung:** `splunk_search`, `splunk_start_search` und `splunk_get_field_summary` stellen den Standardbereich der gewählten Umgebung vor den Suchausdruck, z. B. `search sourcetype="mein:sourcetype" host="inthost01" <query>`.
-- **Überschreiben:** Die Parameter `sourcetype` und `host` am Tool ersetzen den jeweiligen Standard für diesen einen Aufruf.
-- **Abschalten:** `ignore_default_scope=true` sucht ohne Standardbereich.
-- **Keine doppelte Angabe:** Enthält die Query selbst schon `sourcetype=` bzw. `host=`, wird der jeweilige Standard nicht zusätzlich gesetzt.
-- **Generierende Suchen** (Query beginnt mit `|`, z. B. `| tstats`, `| inputlookup`) bleiben unverändert; `meta.scope_applied` ist dann `false`.
-- **Transparenz:** `meta.effective_query` zeigt immer die tatsächlich ausgeführte SPL. `splunk_list_environments` liefert je Umgebung `app`, `default_sourcetype`, `default_host`, `default_index`, damit Gemini den Bereich kennt.
-- **Host-Wert:** Ein einzelner Name, eine Wildcard (`shop-*`) oder eine Kommaliste, die zu `host IN (…)` wird. Werte werden korrekt in Anführungszeichen gesetzt und escaped.
+- Die Suchbegriffe des Modells stehen in Klammern, damit ein `OR` darin den Host-Filter nicht aufweichen kann.
+- `meta.effective_query` zeigt immer die tatsächlich ausgeführte SPL.
 
 ### 1.10 Ausschlussfilter (Spring Actuator)
 
-Health-Checks und Metrik-Abrufe auf `/actuator/…` erzeugen viel Rauschen. Mit `SPLUNK_EXCLUDE_ACTUATOR=true` werden sie aus jeder Suche herausgefiltert, global oder je Umgebung (`SPLUNK_EXCLUDE_ACTUATOR_<NAME>`).
+Health-Checks und Metrik-Abrufe auf `/actuator/…` erzeugen viel Rauschen. Mit `SPLUNK_EXCLUDE_ACTUATOR=true` werden sie aus jeder Suche herausgefiltert.
 
 | Konfiguration | Angehängter Filter |
 |---|---|
@@ -204,10 +211,9 @@ Health-Checks und Metrik-Abrufe auf `/actuator/…` erzeugen viel Rauschen. Mit 
 | zusätzlich `SPLUNK_ACTUATOR_FIELD=uri` | `NOT uri="/actuator*"` (genauer, setzt extrahiertes Feld voraus) |
 | `SPLUNK_EXCLUDE_TERMS=/favicon.ico,/health` | je Eintrag ein weiteres `NOT "<term>"` |
 
-- **Anwendung:** Wie der Standardbereich aus 1.9 – der Filter steht im Basis-Suchausdruck vor der ersten Pipe, damit Splunk die Events gar nicht erst lädt. Gilt für `splunk_search`, `splunk_start_search` und `splunk_get_field_summary`; generierende Suchen (`| …`) und `splunk_run_saved_search` bleiben unverändert.
-- **Abschalten pro Aufruf:** Parameter `include_excluded=true`, z. B. wenn gezielt nach Actuator-Aufrufen gefragt wird. `ignore_default_scope` lässt den Ausschlussfilter unberührt.
-- **Transparenz:** `meta.effective_query` zeigt den Filter, `meta.excluded` listet die aktiven Ausschlüsse. So kann Gemini bei „0 Treffer" erkennen, dass der Filter die Ursache sein könnte.
-- **Grenze des Rohtext-Filters:** Er entfernt auch Events, die `/actuator` nur erwähnen (z. B. in einer Fehlermeldung). Wo das stört, `SPLUNK_ACTUATOR_FIELD` setzen.
+- **Abschalten pro Aufruf:** Parameter `include_excluded=true`, z. B. wenn gezielt nach Actuator-Aufrufen gefragt wird.
+- **Transparenz:** `meta.excluded` listet die aktiven Ausschlüsse.
+- **Grenze des Rohtext-Filters:** Er entfernt auch Events, die `/actuator` nur erwähnen. Wo das stört, `SPLUNK_ACTUATOR_FIELD` setzen.
 
 ---
 
@@ -223,7 +229,7 @@ Health-Checks und Metrik-Abrufe auf `/actuator/…` erzeugen viel Rauschen. Mit 
 | 5 | `splunk_cancel_job` | Job abbrechen | read* |
 | 6 | `splunk_validate_spl` | SPL parsen ohne Ausführung | read |
 | 7 | `splunk_list_indexes` | Indizes mit Größe und Zeitraum | read |
-| 8 | `splunk_list_sourcetypes` | Sourcetypes / Hosts / Sources eines Index | read |
+| 8 | `splunk_list_sourcetypes` | Sourcetypes / Sources der Umgebung | read |
 | 9 | `splunk_get_field_summary` | Felder eines Datenausschnitts | read |
 | 10 | `splunk_get_server_info` | Version, Rollen, Lizenz, Health | read |
 | 11 | `splunk_get_current_user` | Benutzer, Rollen, Capabilities | read |
@@ -233,11 +239,11 @@ Health-Checks und Metrik-Abrufe auf `/actuator/…` erzeugen viel Rauschen. Mit 
 | 15 | `splunk_list_fired_alerts` | Ausgelöste Alerts | read |
 | 16 | `splunk_list_knowledge_objects` | Macros, Lookups, Datamodels, Dashboards, Apps | read |
 | 17 | `splunk_get_knowledge_object` | Definition eines einzelnen Objekts | read |
-| 18 | `splunk_query_kvstore` | KV-Store-Collection lesen | read |
+| 18 | `splunk_query_kvstore` | KV-Store-Collection lesen (nur mit `SPLUNK_ENABLE_KVSTORE=true`) | read |
 
 \* Bricht nur eigene Jobs ab; verändert keine Daten.
 
-Bewusst **19 statt 40 Tools**: Je kleiner die Auswahl, desto treffsicherer wählt Gemini. Knowledge Objects sind deshalb in zwei generischen Tools mit `type`-Enum gebündelt.
+Bewusst **18 (bzw. 19) statt 40 Tools**: Je kleiner die Auswahl, desto treffsicherer wählt Gemini. Knowledge Objects sind deshalb in zwei generischen Tools mit `type`-Enum gebündelt.
 
 ---
 
@@ -247,7 +253,7 @@ Bewusst **19 statt 40 Tools**: Je kleiner die Auswahl, desto treffsicherer wähl
 
 | Parameter | Typ | Pflicht | Beschreibung |
 |---|---|---|---|
-| `environment` | string enum (`TEST` \| `TEST2` \| `INT1` \| `INT2` \| `DEMO`) | ja | "Splunk environment to query. Ask the user if it was not stated; never guess." |
+| `environment` | string enum (die konfigurierten Namen) | ja | "Environment to query. Each environment is a fixed set of hosts. Ask the user if it was not stated; never guess." |
 
 Er ist in den Tabellen unten nicht jedes Mal wiederholt.
 
@@ -257,38 +263,38 @@ Er ist in den Tabellen unten nicht jedes Mal wiederholt.
 
 > List the configured Splunk environments. Use this when the user has not said which environment to use, then ask them to choose.
 
-Keine Parameter. Rückgabe je Umgebung: `name`, `url`, `app`, `default_sourcetype`, `default_host`, `default_index`, `excluded`, `session` (`none` \| `active` \| `failed`). Baut keine Verbindung auf.
+Keine Parameter. Rückgabe je Umgebung: `name`, `hosts`, `app`, `default_sourcetype`, `default_index`, `excluded`. Die gesperrten Hosts werden nicht genannt. Baut keine Verbindung auf.
 
 ### 3.1 Suche
 
 #### `splunk_search`
 
-> Run an SPL search on Splunk and wait for the results. Use this for most questions about log data. Always set a time range and keep `max_rows` small; prefer aggregating in SPL (`stats`, `timechart`, `top`) over fetching raw events. For searches expected to run longer than about two minutes use `splunk_start_search` instead.
+> Run an SPL event search and wait for the results. Use this for most questions about log data. The host filter of the environment, the default sourcetype and the exclusion filters are added automatically and cannot be removed; meta.effective_query shows what actually ran. Write only search terms followed by pipes. Not allowed: a leading pipe, subsearches in [ ], macros, and commands that read other data. Always set a time range and keep max_rows small.
 
 | Parameter | Typ | Pflicht | Beschreibung |
 |---|---|---|---|
-| `query` | string | ja | SPL. Beginnt mit `search`, `|` oder einem Suchausdruck; fehlt `search`/`|`, wird `search ` vorangestellt |
+| `query` | string | ja | Ereignissuche ohne Host-Filter, z. B. `level=ERROR \| stats count by logger`. Darf nicht mit `\|` beginnen |
 | `earliest` | string | nein | Default `SPLUNK_DEFAULT_EARLIEST` |
 | `latest` | string | nein | Default `now` |
 | `max_rows` | integer | nein | Default 100, gedeckelt auf `SPLUNK_MAX_ROWS` |
-| `app` | string | nein | App-Kontext für Macros/Lookups, Default `SPLUNK_APP` |
+| `app` | string | nein | App-Kontext, Default `SPLUNK_APP` |
 | `fields` | string[] | nein | Nur diese Felder zurückgeben |
-| `sourcetype` | string | nein | Überschreibt den Standard-Sourcetype der Umgebung (1.9) |
-| `host` | string | nein | Überschreibt den Standard-Host der Umgebung (1.9) |
-| `ignore_default_scope` | boolean | nein | `true` = ohne Standard-Sourcetype/-Host suchen; Default `false` |
-| `include_excluded` | boolean | nein | `true` = Ausschlussfilter (1.10, z. B. `/actuator`) für diesen Aufruf abschalten; Default `false` |
+| `sourcetype` | string | nein | Ersetzt den Standard-Sourcetype für diesen Aufruf |
+| `include_excluded` | boolean | nein | `true` = Ausschlussfilter (1.10) für diesen Aufruf abschalten |
 
-- **Endpunkt:** `POST /servicesNS/-/{app}/search/v2/jobs` mit `exec_mode=normal`, dann Polling des Jobs, dann `GET …/search/v2/jobs/{sid}/results`.
-- **Rückgabe:** `data` = Ergebniszeilen; `meta` = `sid`, `count`, `total` (`resultCount`), `scan_count`, `run_duration_s`, `earliest`, `latest`, `truncated`, `effective_query`, `scope_applied`, `excluded`, `web_url`.
-- **Verhalten:** SPL-Guard (4.1) vor dem Absenden. Bei Timeout wird der Job **nicht** abgebrochen, sondern `sid` plus Hinweis auf `splunk_get_job_status` zurückgegeben.
+- **Endpunkt:** `POST /servicesNS/{user}/{app}/search/v2/jobs` mit `exec_mode=normal`, dann Polling des Jobs, dann `GET /services/search/v2/jobs/{sid}/results`.
+- **Rückgabe:** `data` = Ergebniszeilen; `meta` = `environment`, `sid`, `count`, `total`, `scan_count`, `run_duration_s`, `earliest`, `latest`, `truncated`, `effective_query`, `hosts`, `excluded`, `blocked_rows` (falls Zeilen entfernt wurden), `web_url`.
+- **Verhalten:** Regeln und Host-Schutz aus 4.1 vor dem Absenden und auf den Ergebnissen. Bei Timeout wird der Job **nicht** abgebrochen, sondern `sid` plus Hinweis auf `splunk_get_job_status` zurückgegeben.
 
 #### `splunk_start_search`
 
-> Start a long-running SPL search in the background and return its job id (`sid`) immediately. Follow up with `splunk_get_job_status` and then `splunk_get_job_results`.
+> Start a long-running SPL event search in the background and return its job id (sid) immediately. Same query rules as splunk_search.
 
 Parameter wie `splunk_search` ohne `max_rows` und `fields`. Rückgabe: `{ sid }`.
 
 #### `splunk_get_job_status`
+
+Gilt für alle drei Job-Tools: Sie akzeptieren nur `sid`s, die dieser Server in dieser Sitzung selbst gestartet hat, und nur in derselben Umgebung. Fremde Jobs (Alerts, Suchen aus der Splunk-Oberfläche) ergeben `UNKNOWN_SID`.
 
 > Check whether a search job is finished and how far it has progressed.
 
@@ -321,15 +327,15 @@ Parameter: `sid` (string, Pflicht). **Endpunkt:** `POST /services/search/v2/jobs
 
 #### `splunk_validate_spl`
 
-> Parse an SPL query without running it. Use this to check syntax before an expensive search or after a syntax error.
+> Check an SPL query without running it: first against this server's rules, then for Splunk syntax.
 
 | Parameter | Typ | Pflicht |
 |---|---|---|
 | `query` | string | ja |
 | `app` | string | nein |
 
-- **Endpunkt:** `POST /servicesNS/-/{app}/search/v2/parser` mit `parse_only=true`
-- **Rückgabe:** `valid`, `commands` (Liste der erkannten Kommandos), `risky_commands` (laut 4.1), `messages`.
+- **Ablauf:** Erst die Regeln aus 4.1 (Fehler `QUERY_NOT_ALLOWED` / `BLOCKED_HOST`), dann `GET /servicesNS/-/{app}/search/v2/parser` mit `parse_only=true` auf der vollständigen Suche inklusive Host-Filter.
+- **Rückgabe:** `valid`, `commands`, `messages`; `meta.effective_query`.
 
 ### 3.2 Daten entdecken
 
@@ -347,32 +353,32 @@ Parameter: `sid` (string, Pflicht). **Endpunkt:** `POST /services/search/v2/jobs
 
 #### `splunk_list_sourcetypes`
 
-> List the sourcetypes, hosts or sources present in an index, with event counts and last-seen time. Use this after `splunk_list_indexes` to learn what kind of data an index contains.
+> List the sourcetypes or sources (log files) that the hosts of the environment send, with event counts and first/last time.
 
 | Parameter | Typ | Pflicht | Beschreibung |
 |---|---|---|---|
-| `index` | string | nein | Default: Standard-Index der Umgebung, sonst die Standard-Indizes der Rolle |
-| `kind` | string enum `sourcetypes` \| `hosts` \| `sources` | nein | Default `sourcetypes` |
+| `index` | string | nein | Default: `SPLUNK_INDEX`, sonst die Standard-Indizes der Rolle |
+| `kind` | string enum `sourcetypes` \| `sources` | nein | Default `sourcetypes` |
 | `earliest` | string | nein | Default `-7d` |
 | `max_rows` | integer | nein | Default 100 |
 
-- **Umsetzung:** `| metadata type={kind} [index={index}] | sort - totalCount | head {max_rows}`
+- **Umsetzung:** Vom Server gebaut, nicht vom Modell: `| tstats count … where [index=…] host=<Umgebung> NOT host=<gesperrt> by sourcetype | sort - totalCount | head {max_rows}`
 - **Rückgabe:** `name`, `total_count`, `first_time`, `last_time`.
+- Eine Host-Liste gibt es bewusst nicht mehr: Die Hosts stehen in `splunk_list_environments`, andere Hosts sollen nicht sichtbar werden.
 
 #### `splunk_get_field_summary`
 
-> Show which fields exist in a slice of data, how often they occur and example values. Use this before writing a search that filters or groups by fields you have not seen yet.
+> Show which fields exist in the environment's data, how often they occur and example values.
 
 | Parameter | Typ | Pflicht | Beschreibung |
 |---|---|---|---|
-| `index` | string | nein | Default: Standard-Index der Umgebung, sonst die Standard-Indizes der Rolle |
-| `sourcetype` | string | nein | Default: Standard der Umgebung |
-| `host` | string | nein | Default: Standard der Umgebung |
+| `index` | string | nein | Default: `SPLUNK_INDEX`, sonst die Standard-Indizes der Rolle |
+| `sourcetype` | string | nein | Default: `SPLUNK_SOURCETYPE` |
 | `earliest` | string | nein | Default `-1h` |
 | `sample_size` | integer | nein | Default 5000 Events |
 | `max_fields` | integer | nein | Default 50 |
 
-- **Umsetzung:** `search index=… sourcetype=… | head {sample_size} | fieldsummary maxvals=5 | sort - count | head {max_fields}`
+- **Umsetzung:** `<Präfix aus 1.9> | head {sample_size} | fieldsummary maxvals=5 | sort - count | head {max_fields}`
 - **Rückgabe:** `field`, `count`, `distinct_count`, `is_numeric`, `top_values` (max. 5).
 
 #### `splunk_get_server_info`
@@ -416,7 +422,7 @@ Parameter: `name` (string, Pflicht), `app` (string, optional).
 
 #### `splunk_run_saved_search`
 
-> Run an existing saved search now and return its results. Alert actions are not triggered.
+> Run the SPL of an existing saved search now, limited to the hosts of the environment, and return the results. Alert actions are not triggered. Only works if the saved SPL is a plain event search.
 
 | Parameter | Typ | Pflicht | Beschreibung |
 |---|---|---|---|
@@ -426,8 +432,8 @@ Parameter: `name` (string, Pflicht), `app` (string, optional).
 | `latest` | string | nein | |
 | `max_rows` | integer | nein | Default 100 |
 
-- **Endpunkt:** `POST …/saved/searches/{name}/dispatch` mit `trigger_actions=0`, danach wie `splunk_search`.
-- Der SPL-Guard gilt auch hier, geprüft wird die gespeicherte SPL.
+- **Umsetzung:** Die gespeicherte Suche wird **nicht** unverändert gestartet. Der Server liest ihre SPL, prüft sie nach den Regeln aus 4.1, stellt den Host-Filter aus 1.9 davor und führt sie wie `splunk_search` aus.
+- Gespeicherte Suchen mit Subsearches, Macros oder generierenden Kommandos werden mit `QUERY_NOT_ALLOWED` abgelehnt.
 
 #### `splunk_list_fired_alerts`
 
@@ -440,7 +446,7 @@ Parameter: `name` (string, Pflicht), `app` (string, optional).
 
 - **Endpunkte:** `GET /services/alerts/fired_alerts` bzw. `…/fired_alerts/{name}`
 - **Rückgabe ohne `name`:** je Alert `alert_name`, `triggered_count`, `app`.
-- **Rückgabe mit `name`:** die einzelnen Auslösungen mit `trigger_time`, `severity`, `sid`.
+- **Rückgabe mit `name`:** die einzelnen Auslösungen mit `trigger_time`, `severity`. Die Ergebnisse der Alert-Jobs sind nicht abrufbar (kein Host-Filter).
 
 ### 3.4 Knowledge Objects
 
@@ -478,11 +484,13 @@ Rückgabe einheitlich: `name`, `app`, `owner`, `sharing`, `summary` (typabhängi
 
 - Dashboards: XML/JSON-Quelltext (`eai:data`), gekürzt auf `SPLUNK_MAX_OUTPUT_CHARS`.
 - Datamodels: Objekt- und Feldliste statt des rohen JSON.
-- Lookup-**Inhalte** werden per `splunk_search` mit `| inputlookup <name>` gelesen.
+- Lookup-**Inhalte** sind nicht abrufbar (`inputlookup` ist gesperrt, siehe 4.1).
 
 ### 3.5 KV Store
 
 #### `splunk_query_kvstore`
+
+Nur registriert mit `SPLUNK_ENABLE_KVSTORE=true`. KV-Store-Inhalte lassen sich keinem Host zuordnen, deshalb ist das Tool standardmäßig aus. Zeilen, die einen gesperrten Host erwähnen, werden auch hier entfernt.
 
 > Read records from a KV store collection. Omit `collection` to list the collections of an app.
 
@@ -503,17 +511,38 @@ Rückgabe einheitlich: `name`, `app`, `owner`, `sharing`, `summary` (typabhängi
 
 ## 4. Sicherheit und Leitplanken
 
-### 4.1 SPL-Guard
+### 4.1 Schutz der gesperrten Hosts (PROD)
 
-Vor jedem Dispatch wird die Query serverseitig geprüft (Tokenisierung an `|`, Subsearches in `[...]` eingeschlossen). Ohne `SPLUNK_ALLOW_RISKY_SPL=true` werden diese Kommandos mit `RISKY_SPL` abgelehnt:
+Daten der Hosts aus `SPLUNK_BLOCKED_HOSTS` dürfen nie in einer Antwort stehen. Dafür greifen vier Ebenen nacheinander:
 
-`delete`, `collect`, `mcollect`, `meventcollect`, `outputlookup`, `outputcsv`, `sendemail`, `sendalert`, `script`, `run`, `runshellscript`, `dump`, `tscollect`, `rest` mit schreibender Methode, `map` (unbegrenzte Subsearch-Schleifen), `dbxquery`, `dbxoutput`.
+**1. Konfiguration.** Ohne `SPLUNK_BLOCKED_HOSTS` startet der Server nicht. Er startet auch nicht, wenn sich ein Umgebungs-Host mit einem gesperrten Host überschneidet (auch per Wildcard).
+
+**2. Regeln für die Suche.** Vor dem Absenden wird jede Suche geprüft, auch die SPL gespeicherter Suchen:
+
+| Regel | Grund |
+|---|---|
+| Kein führendes `\|` (keine generierenden Kommandos wie `tstats`, `metadata`, `inputlookup`, `loadjob`, `rest`) | Sie lesen Daten am Host-Filter vorbei |
+| Keine eckigen Klammern, also keine Subsearches (`append`, `join`, `union`, `foreach` …) | Eine Subsearch ist eine zweite Suche ohne Host-Filter |
+| Keine Backticks, also keine Macros | Ein Macro kann beliebige SPL enthalten |
+| Nach der ersten Pipe nur Kommandos einer festen Liste (`stats`, `eval`, `where`, `rex`, `timechart`, `top`, `table`, `sort`, `lookup` …; vollständig in `src/spl.ts`) | Erlaubt ist nur, was vorhandene Events umformt. Alles Unbekannte, auch App-eigene Kommandos, ist gesperrt |
+| Anführungszeichen und Klammern müssen ausgeglichen sein | Sonst ließe sich die Klammer um die Suchbegriffe vorzeitig schließen |
+| Der Name eines gesperrten Hosts darf nirgends in der Suche vorkommen | Fehler `BLOCKED_HOST` |
+
+Damit entfallen auch alle schreibenden Kommandos (`delete`, `collect`, `outputlookup`, `sendemail` …).
+
+**3. Erzwungener Filter.** Jede Suche läuft als `search host=<Umgebung> NOT host=<gesperrt> ( … )` (siehe 1.9). Beides kann das Modell nicht abschalten.
+
+**4. Filter auf den Ergebnissen.** Bevor Zeilen zurückgegeben werden, entfernt der Server jede Zeile, deren `host` gesperrt ist oder die den Namen eines gesperrten Hosts in irgendeinem Feld enthält. Die Anzahl steht in `meta.blocked_rows`. Der Filter läuft auf den vollständigen Zeilen, bevor `fields` Spalten ausblendet.
 
 Zusätzlich:
 
-- Jede Suche bekommt ein Zeitfenster; `earliest=0` / All-Time nur, wenn das Modell es ausdrücklich setzt und die Antwort einen Hinweis trägt.
-- Bei gesetzter `SPLUNK_ALLOWED_INDEXES` werden Queries abgelehnt, die andere Indizes oder `index=*` nennen.
-- Der Guard ist eine Komfortschranke, kein Sicherheitsmodell. **Die eigentliche Grenze ist die Splunk-Rolle des Tokens** (siehe 4.2).
+- Job-Tools lesen nur Jobs, die der Server selbst gestartet hat (`UNKNOWN_SID` sonst).
+- `splunk_list_sourcetypes` ist auf die Hosts der Umgebung begrenzt; eine Host-Liste über alle Hosts gibt es nicht.
+- `splunk_query_kvstore` ist standardmäßig aus.
+- Die Namen der gesperrten Hosts gibt der Server dem Modell nicht bekannt.
+- Bei gesetzter `SPLUNK_ALLOWED_INDEXES` werden Suchen abgelehnt, die andere Indizes nennen.
+
+**Grenzen.** Der Schutz sitzt in diesem Server, nicht in Splunk. Er verhindert nicht, dass dieselben Zugangsdaten an anderer Stelle (Browser, `curl`) PROD-Daten lesen. Ebene 2 und 3 beruhen darauf, dass dieser Server SPL so zerlegt wie Splunk; Ebene 4 fängt Rohzeilen ab, aber keine aggregierten Werte. Eine echte Garantie gibt nur eine Splunk-Rolle mit Suchfilter (`srchFilter = NOT host=<prod>`), die ein Splunk-Admin einrichten müsste.
 
 ### 4.2 Rechte
 
@@ -542,18 +571,20 @@ Der Server arbeitet mit dem persönlichen AD-Konto des Benutzers; einen Service-
 | `FORBIDDEN` | 403, Capability oder Index fehlt | `splunk_get_current_user` aufrufen |
 | `NOT_FOUND` | Objekt oder `sid` unbekannt | Liste abrufen und Namen prüfen |
 | `SPL_SYNTAX` | Parser-Fehler | Splunk-Meldung lesen, Query korrigieren |
-| `RISKY_SPL` | Vom Guard geblockt | Kommando entfernen; Benutzer informieren |
+| `QUERY_NOT_ALLOWED` | Suche verletzt eine Regel aus 4.1 | Als einfache Ereignissuche neu schreiben |
+| `BLOCKED_HOST` | Suche nennt einen gesperrten Host | Nicht umgehen; Benutzer informieren |
+| `UNKNOWN_SID` | Job nicht von diesem Server gestartet oder andere Umgebung | Suche neu ausführen |
 | `INDEX_NOT_ALLOWED` | Index nicht in der Allowlist | Erlaubte Indizes werden mitgeliefert |
 | `JOB_NOT_DONE` | Ergebnisse noch nicht verfügbar | `splunk_get_job_status` |
 | `JOB_FAILED` | Suchjob ist fehlgeschlagen | Splunk-Meldungen lesen, Query korrigieren |
 | `INVALID_ARGUMENT` | Parameter ungültig (z. B. KV-Store-Query kein JSON) | Parameter korrigieren |
-| `TLS_FINGERPRINT_MISSING` | Modus `pinned` ohne hinterlegten Fingerprint | `node dist/cli.js fingerprint <NAME> <url>` ausführen |
+| `TLS_FINGERPRINT_MISSING` | Modus `pinned` ohne hinterlegten Fingerprint | `node dist/cli.js fingerprint <url>` ausführen |
 | `CONFIG_ERROR` | Konfiguration unvollständig oder fehlerhaft | Server startet nicht; Meldung auf stderr |
 | `TIMEOUT` | Wartezeit überschritten, Job läuft weiter | `sid` weiterverwenden |
 | `TLS_ERROR` | Zertifikat nicht vertrauenswürdig (`verify`) | `SPLUNK_CA_CERT` setzen oder auf `pinned` wechseln |
-| `TLS_FINGERPRINT_MISMATCH` | Zertifikat passt nicht zum hinterlegten Fingerprint | `node dist/cli.js fingerprint <NAME> <url>` neu ausführen, Benutzer informieren |
+| `TLS_FINGERPRINT_MISMATCH` | Zertifikat passt nicht zum hinterlegten Fingerprint | `node dist/cli.js fingerprint` neu ausführen, Benutzer informieren |
 | `HTTP_NOT_ALLOWED` | `http://`-URL ohne `SPLUNK_ALLOW_HTTP` | Flag setzen oder `https://` verwenden |
-| `UNREACHABLE` | Host/Port nicht erreichbar | `SPLUNK_URL_<NAME>` und Port prüfen |
+| `UNREACHABLE` | Host/Port nicht erreichbar | `SPLUNK_URL` und Port prüfen |
 | `UNKNOWN_ENVIRONMENT` | Umgebung nicht konfiguriert | Gültige Namen werden mitgeliefert; Benutzer fragen |
 | `LOGIN_BLOCKED` | Nach `AUTH_FAILED` sind Logins gesperrt | Passwort neu verschlüsseln, Server neu starten |
 
@@ -563,8 +594,8 @@ Der Server arbeitet mit dem persönlichen AD-Konto des Benutzers; einen Service-
 
 ```text
 0. Umgebung klären (vom Benutzer genannt, sonst nachfragen)
-1. splunk_list_indexes                → Wo liegen die Daten?
-2. splunk_list_sourcetypes(index)     → Welche Datenarten?
+1. splunk_list_sourcetypes            → Welche Logs liefern die Hosts der Umgebung?
+2. (optional) splunk_list_indexes     → Welche Indizes gibt es?
 3. splunk_get_field_summary(index, …) → Welche Felder?
 4. splunk_search(query, earliest, …)  → Aggregiert fragen, kleines max_rows
 5. Bei truncated=true                 → Query enger fassen oder splunk_get_job_results(offset)
@@ -572,31 +603,21 @@ Der Server arbeitet mit dem persönlichen AD-Konto des Benutzers; einen Service-
 
 Der Server liefert diesen Ablauf beim Verbinden als MCP-`instructions` mit. Eigene Ergänzungen können zusätzlich in eine `GEMINI.md` geschrieben werden.
 
-### 6.1 Was Gemini selbst herausfindet und was nicht
+### 6.1 Was Gemini selbst herausfindet
 
-| Frage | Quelle | Automatisch? |
-|---|---|---|
-| Welche Indizes gibt es? | `splunk_list_indexes` | ja |
-| Welche Hosts / Sourcetypes / Sources liefern in einen Index? | `splunk_list_sourcetypes` mit `kind` | ja |
-| Welche Felder gibt es? | `splunk_get_field_summary` | ja |
-| Welcher Index / Host gehört zu welchem **Projekt**? | Splunk kennt kein „Projekt" | **nein** – nur über Namensschema oder `GEMINI.md` |
+| Frage | Quelle |
+|---|---|
+| Welche Umgebungen und Hosts gibt es? | `splunk_list_environments` |
+| Welche Sourcetypes / Log-Dateien liefern die Hosts? | `splunk_list_sourcetypes` |
+| Welche Felder gibt es? | `splunk_get_field_summary` |
 
-Das Wissen bleibt nicht zwischen Sitzungen erhalten. Feste Zuordnungen (Projekt → Index, Host-Namensschema, wichtige Sourcetypes und Felder) gehören deshalb in die `GEMINI.md`, z. B.:
-
-```markdown
-## Splunk-Umgebung
-- Projekt "shop": index=app_shop, Hosts shop-web-*, shop-db-*
-- Projekt "billing": index=app_billing, Feld `service` unterscheidet Komponenten
-- Firewall-Logs: index=net_fw, sourcetype=pan:traffic
-```
+Das Wissen bleibt nicht zwischen Sitzungen erhalten. Feste Hinweise (wichtige Felder, typische Suchen) können in eine `GEMINI.md` geschrieben werden.
 
 ---
 
 ## 7. Offene Punkte
 
-- [ ] Hostnamen der fünf Umgebungen, App-Name, Sourcetype und Host je Umgebung.
-- [ ] Ist 8089 in allen fünf Umgebungen erreichbar (bisher an einer geprüft)?
-- [ ] Einzelner Search Head oder Search-Head-Cluster (Jobs sind an den Member gebunden; hinter einem Load Balancer braucht es Sticky Sessions).
-- [ ] Wie werden Projekte in Splunk unterschieden (Index, Feld, Host-Namensschema)? Siehe 6.1.
+- [ ] Erster Lauf gegen die echte Instanz (10.2.7): Login, eine einfache Suche, `splunk_list_sourcetypes`.
+- [ ] Hostnamen der Umgebungen und des PROD-Hosts eintragen; prüfen, ob PROD mehrere Hosts hat.
+- [ ] Mit einem Splunk-Admin klären, ob eine Rolle mit `srchFilter` möglich ist (siehe Grenzen in 4.1).
 - [ ] Enterprise Security im Einsatz? Dann eigene Tools für Notables sinnvoll.
-- [ ] MCP-Resources/Prompts (z. B. `/splunk:investigate` als Slash-Command in der Gemini CLI) als Phase 2.

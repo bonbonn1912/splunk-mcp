@@ -2,6 +2,7 @@ import type { Config } from "./config.js";
 import { enc, type SplunkClient } from "./client.js";
 import { SplunkMcpError } from "./errors.js";
 import { cleanRow, type Row } from "./format.js";
+import { isBlockedHost, mentionsBlockedHost } from "./spl.js";
 
 export interface JobStatus {
   sid: string;
@@ -18,6 +19,50 @@ export interface JobStatus {
 
 interface JobEntry {
   entry?: Array<{ content?: Record<string, unknown> }>;
+}
+
+/**
+ * Only jobs started by this server process may be read. Any other sid (an alert
+ * job, a search from the Splunk UI) could contain data without the host filter.
+ */
+const ownJobs = new Map<string, string>();
+
+export function registerJob(sid: string, environment: string): void {
+  ownJobs.set(sid, environment);
+}
+
+export function assertOwnJob(sid: string, environment: string): void {
+  const owner = ownJobs.get(sid);
+  if (owner === undefined) {
+    throw new SplunkMcpError("UNKNOWN_SID", "This job id was not created by this server in this session.", {
+      hint: "Only jobs started with splunk_search or splunk_start_search in this session can be read. Run the search again.",
+    });
+  }
+  if (owner !== environment) {
+    throw new SplunkMcpError("UNKNOWN_SID", `This job belongs to environment ${owner}, not ${environment}.`, {
+      hint: `Use environment ${owner} for this sid.`,
+    });
+  }
+}
+
+/** Last line of defence: drops every row that comes from or mentions a blocked host. */
+export function dropBlockedRows(rows: Row[], blockedHosts: string[]): { rows: Row[]; blocked: number } {
+  const kept: Row[] = [];
+  let blocked = 0;
+  for (const row of rows) {
+    const hostValue = row.host;
+    const hosts = Array.isArray(hostValue) ? hostValue.map(String) : hostValue === undefined ? [] : [String(hostValue)];
+    const bad =
+      hosts.some((h) => isBlockedHost(h, blockedHosts)) ||
+      Object.values(row).some((v) =>
+        Array.isArray(v)
+          ? v.some((x) => typeof x === "string" && mentionsBlockedHost(x, blockedHosts))
+          : typeof v === "string" && mentionsBlockedHost(v, blockedHosts),
+      );
+    if (bad) blocked++;
+    else kept.push(row);
+  }
+  return { rows: kept, blocked };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -41,10 +86,12 @@ export async function createJob(
     auto_cancel: opts.autoCancelS,
   });
   if (!res.sid) throw new SplunkMcpError("SPLUNK_ERROR", "Splunk did not return a job id (sid).");
+  registerJob(res.sid, client.env.name);
   return res.sid;
 }
 
 export async function jobStatus(client: SplunkClient, sid: string): Promise<JobStatus> {
+  assertOwnJob(sid, client.env.name);
   const res = await client.get<JobEntry>(`/services/search/v2/jobs/${enc(sid)}`);
   const c = res.entry?.[0]?.content ?? {};
   const messages = Array.isArray(c.messages)
@@ -92,14 +139,20 @@ export async function waitForJob(client: SplunkClient, sid: string, timeoutS: nu
 export async function jobResults(
   client: SplunkClient,
   sid: string,
-  opts: { offset: number; count: number; fields?: string[] },
-): Promise<{ rows: Row[]; messages: string[] }> {
+  opts: { offset: number; count: number; fields?: string[]; blockedHosts: string[] },
+): Promise<{ rows: Row[]; fetched: number; blocked: number; messages: string[] }> {
+  assertOwnJob(sid, client.env.name);
   const res = await client.get<{ results?: Row[]; messages?: Array<{ type?: string; text?: string }> }>(
     `/services/search/v2/jobs/${enc(sid)}/results`,
     { offset: opts.offset, count: opts.count },
   );
+  const raw = res.results ?? [];
+  // Filter on the full rows, before any field selection hides the host.
+  const { rows, blocked } = dropBlockedRows(raw, opts.blockedHosts);
   return {
-    rows: (res.results ?? []).map((r) => cleanRow(r, opts.fields)),
+    rows: rows.map((r) => cleanRow(r, opts.fields)),
+    fetched: raw.length,
+    blocked,
     messages: (res.messages ?? []).map((m) => `${m.type ?? "INFO"}: ${m.text ?? ""}`),
   };
 }
@@ -118,7 +171,7 @@ export function webUrl(
   latest: string,
 ): string {
   const params = new URLSearchParams({ q: query, earliest, latest });
-  return `${client.env.webUrl}/${config.locale}/app/${enc(app)}/search?${params.toString()}`;
+  return `${config.connection.webUrl}/${config.locale}/app/${enc(app)}/search?${params.toString()}`;
 }
 
 /** Runs a query to completion and returns cleaned rows. Used by helper tools. */
@@ -127,9 +180,14 @@ export async function runSearch(
   config: Config,
   query: string,
   opts: { earliest: string; latest: string; app: string; maxRows: number; fields?: string[] },
-): Promise<{ sid: string; status: JobStatus; rows: Row[]; messages: string[] }> {
+): Promise<{ sid: string; status: JobStatus; rows: Row[]; fetched: number; blocked: number; messages: string[] }> {
   const sid = await createJob(client, query, { ...opts, autoCancelS: 300 });
   const status = await waitForJob(client, sid, config.searchTimeoutS);
-  const { rows, messages } = await jobResults(client, sid, { offset: 0, count: opts.maxRows, fields: opts.fields });
-  return { sid, status, rows, messages };
+  const res = await jobResults(client, sid, {
+    offset: 0,
+    count: opts.maxRows,
+    fields: opts.fields,
+    blockedHosts: config.blockedHosts,
+  });
+  return { sid, status, ...res };
 }

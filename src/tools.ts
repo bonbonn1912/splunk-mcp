@@ -5,8 +5,8 @@ import { ClientPool, enc, type SplunkClient } from "./client.js";
 import { type Config, log } from "./config.js";
 import { SplunkMcpError } from "./errors.js";
 import { contains, fail, isoTime, ok, type Row } from "./format.js";
-import { clampRows, createJob, jobResults, jobStatus, runSearch, waitForJob, webUrl } from "./search.js";
-import { applyScope, exclusionClauses, findRiskyCommands, guardQuery } from "./spl.js";
+import { assertOwnJob, clampRows, createJob, dropBlockedRows, jobResults, jobStatus, runSearch, webUrl } from "./search.js";
+import { applyScope, blockedClause, exclusionClauses, hostClause, quote, validateQuery } from "./spl.js";
 
 interface Entry {
   name: string;
@@ -42,7 +42,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
   const envNames = [...config.environments.keys()] as [string, ...string[]];
   const environment = z
     .enum(envNames)
-    .describe("Splunk environment to query. Ask the user if it was not stated; never guess.");
+    .describe("Environment to query. Each environment is a fixed set of hosts. Ask the user if it was not stated; never guess.");
 
   /** Registers a read-only tool that takes `environment` as its first parameter. */
   function tool<S extends Shape>(
@@ -89,7 +89,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
     "splunk_list_environments",
     {
       description:
-        "List the configured Splunk environments with their app, default sourcetype/host and active exclusion filters. Use this when the user has not said which environment to use, then ask them to choose.",
+        "List the configured environments with their hosts, app, default sourcetype and active exclusion filters. Use this when the user has not said which environment to use, then ask them to choose.",
       inputSchema: {},
       annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     },
@@ -98,15 +98,14 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
         {
           data: [...config.environments.values()].map((e) => ({
             name: e.name,
-            url: e.url,
+            hosts: e.hosts,
             app: e.app,
             default_sourcetype: e.defaultSourcetype ?? null,
-            default_host: e.defaultHost ?? null,
             default_index: e.defaultIndex ?? null,
             excluded: exclusionClauses(e),
-            session: pool.sessionState(e.name),
           })),
-          meta: { count: config.environments.size },
+          meta: { count: config.environments.size, session: pool.connection.sessionState },
+          hint: "Every search is limited to the hosts of the chosen environment. Other hosts cannot be searched.",
         },
         config.maxOutputChars,
       ),
@@ -114,15 +113,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   // ---------------------------------------------------------------- 3.1 search
   const scopeShape = {
-    sourcetype: z.string().optional().describe("Overrides the environment's default sourcetype for this call."),
-    host: z
-      .string()
-      .optional()
-      .describe("Overrides the environment's default host for this call. Wildcards (web-*) and comma lists are allowed."),
-    ignore_default_scope: z
-      .boolean()
-      .optional()
-      .describe("true = do not add the environment's default sourcetype/host/index. Default false."),
+    sourcetype: z.string().optional().describe("Overrides the default sourcetype for this call."),
     include_excluded: z
       .boolean()
       .optional()
@@ -130,38 +121,35 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
   };
 
   function prepare(
-    args: {
-      query: string;
-      earliest?: string;
-      latest?: string;
-      app?: string;
-      sourcetype?: string;
-      host?: string;
-      ignore_default_scope?: boolean;
-      include_excluded?: boolean;
-    },
+    args: { query: string; earliest?: string; latest?: string; app?: string; sourcetype?: string; include_excluded?: boolean },
     { client }: Ctx,
   ) {
-    const scoped = applyScope(args.query, client.env, {
+    validateQuery(args.query, client.env, config.blockedHosts);
+    if (args.sourcetype) validateQuery(`sourcetype=${quote(args.sourcetype)}`, client.env, config.blockedHosts);
+    const scoped = applyScope(args.query, client.env, config.blockedHosts, {
       sourcetype: args.sourcetype,
-      host: args.host,
-      ignoreDefaultScope: args.ignore_default_scope,
       includeExcluded: args.include_excluded,
     });
-    guardQuery(scoped.query, client.env, config.allowRiskySpl);
     const earliest = args.earliest ?? config.defaultEarliest;
     const latest = args.latest ?? "now";
     const app = args.app ?? client.env.app;
     return { scoped, earliest, latest, app };
   }
 
+  /** Notes shared by all tools that return search rows. */
+  function blockedNote(blocked: number): string | undefined {
+    return blocked > 0
+      ? `${blocked} row(s) were removed because they refer to a blocked host. Do not try to retrieve them.`
+      : undefined;
+  }
+
   tool(
     "splunk_search",
-    "Run an SPL search on Splunk and wait for the results. Use this for most questions about log data. The environment's default sourcetype/host and exclusion filters are added automatically; meta.effective_query shows what actually ran. Always set a time range and keep max_rows small; prefer aggregating in SPL (stats, timechart, top) over fetching raw events. For searches expected to run longer than about two minutes use splunk_start_search instead.",
+    "Run an SPL event search and wait for the results. Use this for most questions about log data. The host filter of the environment, the default sourcetype and the exclusion filters are added automatically and cannot be removed; meta.effective_query shows what actually ran. Write only search terms followed by pipes (stats, eval, where, rex, timechart, ...). Not allowed: a leading pipe, subsearches in [ ], macros, and commands that read other data (append, join, tstats, inputlookup, ...). Always set a time range and keep max_rows small; prefer aggregating over fetching raw events. For searches expected to run longer than about two minutes use splunk_start_search.",
     {
       query: z
         .string()
-        .describe('SPL query. Either search terms (e.g. `level=ERROR | stats count by logger`) or a generating command starting with "|".'),
+        .describe("SPL event search without host filter, e.g. `level=ERROR | stats count by logger`. Must not start with a pipe."),
       earliest: earliestParam(config.defaultEarliest),
       latest: latestParam,
       max_rows: maxRows(100),
@@ -173,23 +161,25 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       const { client } = ctx;
       const { scoped, earliest, latest, app } = prepare(args, ctx);
       const limit = clampRows(args.max_rows, 100, config);
-      const { sid, status, rows, messages } = await runSearch(client, config, scoped.query, {
+      const { sid, status, rows, fetched, blocked, messages } = await runSearch(client, config, scoped.query, {
         earliest,
         latest,
         app,
         maxRows: limit,
         fields: args.fields,
       });
-      const truncated = status.result_count > rows.length;
+      const truncated = status.result_count > fetched;
       const hints: string[] = [];
       if (truncated) {
         hints.push(
-          `Showing ${rows.length} of ${status.result_count} results. Aggregate in SPL or call splunk_get_job_results with sid and offset=${rows.length}.`,
+          `Showing ${fetched} of ${status.result_count} results. Aggregate in SPL or call splunk_get_job_results with sid and offset=${fetched}.`,
         );
       }
-      if (rows.length === 0 && (scoped.scopeApplied || scoped.excluded.length > 0)) {
+      const note = blockedNote(blocked);
+      if (note) hints.push(note);
+      if (rows.length === 0 && blocked === 0) {
         hints.push(
-          "No results. Check meta.effective_query: the default sourcetype/host or the exclusion filter may be the reason. Widen the time range or use ignore_default_scope / include_excluded if the user wants that.",
+          "No results. Check meta.effective_query: the host filter, the default sourcetype or the exclusion filter may be the reason. Widen the time range, or use sourcetype / include_excluded if the user wants that.",
         );
       }
       if (earliest === "0" || earliest === "1") hints.push("This was an all-time search, which is expensive.");
@@ -208,8 +198,9 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
             latest,
             truncated,
             effective_query: scoped.query,
-            scope_applied: scoped.scopeApplied,
+            hosts: client.env.hosts,
             excluded: scoped.excluded,
+            ...(blocked > 0 ? { blocked_rows: blocked } : {}),
             web_url: webUrl(client, config, app, scoped.query, earliest, latest),
             ...(messages.length > 0 ? { splunk_messages: messages } : {}),
           },
@@ -223,9 +214,9 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_start_search",
-    "Start a long-running SPL search in the background and return its job id (sid) immediately. Follow up with splunk_get_job_status and then splunk_get_job_results, using the same environment.",
+    "Start a long-running SPL event search in the background and return its job id (sid) immediately. Same query rules as splunk_search. Follow up with splunk_get_job_status and then splunk_get_job_results, using the same environment.",
     {
-      query: z.string().describe('SPL query. Search terms or a generating command starting with "|".'),
+      query: z.string().describe("SPL event search without host filter. Must not start with a pipe."),
       earliest: earliestParam(config.defaultEarliest),
       latest: latestParam,
       app: appParam,
@@ -243,7 +234,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
             earliest,
             latest,
             effective_query: scoped.query,
-            scope_applied: scoped.scopeApplied,
+            hosts: client.env.hosts,
             excluded: scoped.excluded,
             web_url: webUrl(client, config, app, scoped.query, earliest, latest),
           },
@@ -256,7 +247,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_get_job_status",
-    "Check whether a search job is finished and how far it has progressed. The sid is only valid in the environment that created it.",
+    "Check whether a search job is finished and how far it has progressed. Only works for jobs started by splunk_search or splunk_start_search in this session, in the same environment.",
     { sid: z.string().describe("Search job id returned by splunk_start_search or splunk_search.") },
     async ({ sid }, { client }) => {
       const status = await jobStatus(client, sid);
@@ -277,7 +268,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_get_job_results",
-    "Fetch a page of results from a finished search job. Use offset to page through large result sets.",
+    "Fetch a page of results from a finished search job that was started by splunk_search or splunk_start_search in this session. Use offset to page through large result sets.",
     {
       sid: z.string().describe("Search job id."),
       offset,
@@ -299,8 +290,13 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       }
       const off = args.offset ?? 0;
       const limit = clampRows(args.max_rows, 100, config);
-      const { rows } = await jobResults(client, args.sid, { offset: off, count: limit, fields: args.fields });
-      const more = off + rows.length < status.result_count;
+      const { rows, fetched, blocked } = await jobResults(client, args.sid, {
+        offset: off,
+        count: limit,
+        fields: args.fields,
+        blockedHosts: config.blockedHosts,
+      });
+      const more = off + fetched < status.result_count;
       return ok(
         {
           data: rows,
@@ -311,9 +307,13 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
             total: status.result_count,
             offset: off,
             truncated: more,
-            ...(more ? { next_offset: off + rows.length } : {}),
+            ...(more ? { next_offset: off + fetched } : {}),
+            ...(blocked > 0 ? { blocked_rows: blocked } : {}),
           },
-          hint: more ? `More results available. Call again with offset=${off + rows.length}.` : undefined,
+          hint:
+            [more ? `More results available. Call again with offset=${off + fetched}.` : undefined, blockedNote(blocked)]
+              .filter(Boolean)
+              .join(" ") || undefined,
         },
         config.maxOutputChars,
       );
@@ -325,6 +325,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
     "Cancel a running search job that is no longer needed. Only affects the user's own search job, no data is changed.",
     { sid: z.string().describe("Search job id.") },
     async ({ sid }, { client }) => {
+      assertOwnJob(sid, client.env.name);
       await client.post(`/services/search/v2/jobs/${enc(sid)}/control`, { action: "cancel" });
       return ok({ data: { sid, cancelled: true }, meta: { environment: client.env.name } }, config.maxOutputChars);
     },
@@ -332,12 +333,11 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_validate_spl",
-    "Parse an SPL query without running it. Use this to check syntax before an expensive search or after a syntax error. The query is checked exactly as given (no default scope is added).",
+    "Check an SPL query without running it: first against this server's rules (event search only, no subsearches or macros, allowed commands), then for Splunk syntax. Use this before an expensive search or after an error.",
     { query: z.string().describe("SPL query to check."), app: appParam },
     async (args, { client }) => {
-      const trimmed = args.query.trim();
-      const q = trimmed.startsWith("|") || /^search\b/i.test(trimmed) ? trimmed : `search ${trimmed}`;
-      const risky = findRiskyCommands(q);
+      validateQuery(args.query, client.env, config.blockedHosts);
+      const q = applyScope(args.query, client.env, config.blockedHosts).query;
       const app = args.app ?? client.env.app;
       const call = (path: string) =>
         client.get<{ commands?: Array<{ command?: string }> }>(`/servicesNS/-/${enc(app)}/${path}`, {
@@ -357,14 +357,9 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
             data: {
               valid: true,
               commands: (res.commands ?? []).map((c) => c.command).filter(Boolean),
-              risky_commands: risky,
               messages: [],
             },
-            meta: { environment: client.env.name },
-            hint:
-              risky.length > 0 && !config.allowRiskySpl
-                ? `Syntax is valid, but these commands are blocked on this server: ${risky.join(", ")}.`
-                : undefined,
+            meta: { environment: client.env.name, effective_query: q },
           },
           config.maxOutputChars,
         );
@@ -372,7 +367,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
         if (err instanceof SplunkMcpError && err.code === "SPL_SYNTAX") {
           return ok(
             {
-              data: { valid: false, commands: [], risky_commands: risky, messages: err.splunkMessages },
+              data: { valid: false, commands: [], messages: err.splunkMessages },
               meta: { environment: client.env.name },
               hint: "Fix the query according to the Splunk messages.",
             },
@@ -422,20 +417,32 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_list_sourcetypes",
-    "List the sourcetypes, hosts or sources that send data, with event counts and last-seen time. Use this to find out which hosts or kinds of logs exist. Without index it covers the default indexes of the user's role.",
+    "List the sourcetypes or sources (log files) that the hosts of the environment send, with event counts and first/last time. Use this to find out which kinds of logs exist in an environment.",
     {
       index: z.string().optional().describe("Index name. Default: the environment's default index, otherwise the role's default indexes."),
-      kind: z.enum(["sourcetypes", "hosts", "sources"]).optional().describe("What to list. Default sourcetypes."),
+      kind: z.enum(["sourcetypes", "sources"]).optional().describe("What to list. Default sourcetypes."),
       earliest: earliestParam("-7d"),
       max_rows: maxRows(100),
     },
     async (args, { client }) => {
       const kind = args.kind ?? "sourcetypes";
+      const field = kind === "sourcetypes" ? "sourcetype" : "source";
       const index = args.index ?? client.env.defaultIndex;
-      if (index) assertIndexName(index);
+      if (index) {
+        assertIndexName(index);
+        const allowed = client.env.allowedIndexes;
+        if (allowed.length > 0 && !allowed.some((a) => a.toLowerCase() === index.toLowerCase())) {
+          throw new SplunkMcpError("INDEX_NOT_ALLOWED", `Index not allowed in ${client.env.name}: ${index}.`, {
+            hint: `Allowed indexes: ${allowed.join(", ")}.`,
+          });
+        }
+      }
       const limit = clampRows(args.max_rows, 100, config);
-      const query = `| metadata type=${kind}${index ? ` index=${index}` : ""} | sort - totalCount | head ${limit}`;
-      guardQuery(query, client.env, config.allowRiskySpl);
+      // Built by the server, not by the model: an indexed-field query limited to the environment's hosts.
+      const where = [index ? `index=${quote(index)}` : undefined, hostClause(client.env.hosts), blockedClause(config.blockedHosts)]
+        .filter(Boolean)
+        .join(" ");
+      const query = `| tstats count as totalCount min(_time) as firstTime max(_time) as lastTime where ${where} by ${field} | sort - totalCount | head ${limit}`;
       const earliest = args.earliest ?? "-7d";
       const { rows } = await runSearch(client, config, query, {
         earliest,
@@ -443,7 +450,6 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
         app: client.env.app,
         maxRows: limit,
       });
-      const field = kind === "sourcetypes" ? "sourcetype" : kind === "hosts" ? "host" : "source";
       const data = rows.map((r) => ({
         name: r[field] ?? null,
         total_count: Number(r.totalCount ?? 0),
@@ -453,7 +459,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       return ok(
         {
           data,
-          meta: { environment: client.env.name, kind, index: index ?? "(role default indexes)", earliest, count: data.length },
+          meta: { environment: client.env.name, hosts: client.env.hosts, kind, index: index ?? "(role default indexes)", earliest, count: data.length },
           hint: "Next: splunk_get_field_summary to see which fields the data has.",
         },
         config.maxOutputChars,
@@ -463,11 +469,10 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_get_field_summary",
-    "Show which fields exist in a slice of data, how often they occur and example values. Use this before writing a search that filters or groups by fields you have not seen yet. Uses the environment's default sourcetype/host unless overridden.",
+    "Show which fields exist in the environment's data, how often they occur and example values. Use this before writing a search that filters or groups by fields you have not seen yet.",
     {
       index: z.string().optional().describe("Index name. Default: the environment's default index, otherwise the role's default indexes."),
-      sourcetype: z.string().optional().describe("Default: the environment's default sourcetype."),
-      host: z.string().optional().describe("Default: the environment's default host."),
+      sourcetype: z.string().optional().describe("Default: the configured default sourcetype."),
       earliest: earliestParam("-1h"),
       sample_size: z.number().int().min(1).optional().describe("Number of events to sample. Default 5000."),
       max_fields: z.number().int().min(1).optional().describe("Maximum fields to return. Default 50."),
@@ -476,9 +481,10 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       if (args.index) assertIndexName(args.index);
       const sample = Math.min(args.sample_size ?? 5000, 50000);
       const maxFields = Math.min(args.max_fields ?? 50, 200);
-      const scoped = applyScope("", client.env, { index: args.index, sourcetype: args.sourcetype, host: args.host });
+      if (args.sourcetype) validateQuery(`sourcetype=${quote(args.sourcetype)}`, client.env, config.blockedHosts);
+      if (args.index) validateQuery(`index=${args.index}`, client.env, config.blockedHosts);
+      const scoped = applyScope("", client.env, config.blockedHosts, { index: args.index, sourcetype: args.sourcetype });
       const query = `${scoped.query} | head ${sample} | fieldsummary maxvals=5 | sort - count | head ${maxFields}`;
-      guardQuery(query, client.env, config.allowRiskySpl);
       const earliest = args.earliest ?? "-1h";
       const { rows } = await runSearch(client, config, query, {
         earliest,
@@ -506,8 +512,8 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       return ok(
         {
           data,
-          meta: { environment: client.env.name, earliest, count: data.length, effective_query: query },
-          hint: data.length === 0 ? "No events in this slice. Widen the time range or check sourcetype/host." : undefined,
+          meta: { environment: client.env.name, hosts: client.env.hosts, earliest, count: data.length, effective_query: query },
+          hint: data.length === 0 ? "No events in this slice. Widen the time range or check the sourcetype." : undefined,
         },
         config.maxOutputChars,
       );
@@ -676,7 +682,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_run_saved_search",
-    "Run an existing saved search now and return its results. Alert actions are not triggered. The saved SPL runs unchanged (no default scope is added).",
+    "Run the SPL of an existing saved search now, limited to the hosts of the environment, and return the results. Alert actions are not triggered. Only works if the saved SPL is a plain event search (no leading pipe, subsearches, macros or commands that read other data).",
     {
       name: z.string().describe("Exact name of the saved search."),
       app: anyAppParam,
@@ -687,38 +693,46 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
     async (args, { client }) => {
       const e = await loadSavedSearch(client, args.name, args.app);
       const spl = String(e.content?.search ?? "");
-      guardQuery(spl, client.env, config.allowRiskySpl);
-      const app = e.acl?.app ?? client.env.app;
-      const owner = e.acl?.sharing === "user" ? (e.acl.owner ?? "nobody") : "nobody";
-      const res = await client.post<{ sid?: string }>(
-        `/servicesNS/${enc(owner)}/${enc(app)}/saved/searches/${enc(e.name)}/dispatch`,
-        {
-          trigger_actions: 0,
-          "dispatch.earliest_time": args.earliest,
-          "dispatch.latest_time": args.latest,
-        },
-      );
-      if (!res.sid) throw new SplunkMcpError("SPLUNK_ERROR", "Splunk did not return a job id (sid).");
-      const status = await waitForJob(client, res.sid, config.searchTimeoutS);
+      // The stored SPL is never dispatched as is: it goes through the same checks
+      // and gets the same mandatory host filter as a query written by the model.
+      validateQuery(spl, client.env, config.blockedHosts);
+      const scoped = applyScope(spl, client.env, config.blockedHosts);
+      const earliest = args.earliest ?? String(e.content?.["dispatch.earliest_time"] || config.defaultEarliest);
+      const latest = args.latest ?? String(e.content?.["dispatch.latest_time"] || "now");
       const limit = clampRows(args.max_rows, 100, config);
-      const { rows } = await jobResults(client, res.sid, { offset: 0, count: limit });
-      const truncated = status.result_count > rows.length;
+      const { sid, status, rows, fetched, blocked } = await runSearch(client, config, scoped.query, {
+        earliest,
+        latest,
+        app: e.acl?.app ?? client.env.app,
+        maxRows: limit,
+      });
+      const truncated = status.result_count > fetched;
       return ok(
         {
           data: rows,
           meta: {
             environment: client.env.name,
-            sid: res.sid,
+            sid,
             count: rows.length,
             total: status.result_count,
             offset: 0,
             truncated,
             run_duration_s: status.run_duration_s,
-            effective_query: spl,
+            earliest,
+            latest,
+            effective_query: scoped.query,
+            hosts: client.env.hosts,
+            ...(blocked > 0 ? { blocked_rows: blocked } : {}),
           },
-          hint: truncated
-            ? `Showing ${rows.length} of ${status.result_count} results. Call splunk_get_job_results with sid and offset=${rows.length}.`
-            : undefined,
+          hint:
+            [
+              truncated
+                ? `Showing ${fetched} of ${status.result_count} results. Call splunk_get_job_results with sid and offset=${fetched}.`
+                : undefined,
+              blockedNote(blocked),
+            ]
+              .filter(Boolean)
+              .join(" ") || undefined,
         },
         config.maxOutputChars,
       );
@@ -727,7 +741,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_list_fired_alerts",
-    "List alerts that have triggered recently. Without name: one row per alert with its trigger count. With name: the individual trigger events with time and severity.",
+    "List alerts that have triggered recently (names, counts, times only; the alert results themselves are not accessible). Without name: one row per alert with its trigger count. With name: the individual trigger events with time and severity.",
     {
       name: z.string().optional().describe("Alert name for the individual trigger events."),
       max_rows: maxRows(50),
@@ -753,7 +767,6 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
         alert_name: e.content?.savedsearch_name ?? args.name,
         trigger_time: isoTime(e.content?.trigger_time),
         severity: e.content?.severity ?? null,
-        sid: e.content?.sid ?? null,
         triggered_count: Number(e.content?.triggered_alerts ?? 0),
         app: e.acl?.app ?? null,
       }));
@@ -834,7 +847,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_get_knowledge_object",
-    "Return the full definition of one macro, lookup, data model or dashboard. To read the rows of a lookup use splunk_search with `| inputlookup <name>`.",
+    "Return the full definition of one macro, lookup, data model or dashboard (configuration only, no data rows).",
     {
       type: z.enum(["macros", "lookups", "datamodels", "dashboards"]).describe("Kind of object."),
       name: z.string().describe("Exact name of the object."),
@@ -897,6 +910,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
   );
 
   // ---------------------------------------------------------------- 3.5 KV store
+  if (config.enableKvstore)
   tool(
     "splunk_query_kvstore",
     "Read records from a KV store collection. Omit collection to list the collections of an app.",
@@ -930,8 +944,9 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
         { query: args.query, fields: args.fields?.join(","), sort: args.sort, limit, skip: off },
         true,
       );
-      const data = Array.isArray(rows) ? rows : [];
-      const maybeMore = data.length === limit;
+      const all = Array.isArray(rows) ? rows : [];
+      const { rows: data, blocked } = dropBlockedRows(all, config.blockedHosts);
+      const maybeMore = all.length === limit;
       return ok(
         {
           data,
@@ -942,9 +957,13 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
             count: data.length,
             offset: off,
             truncated: maybeMore,
-            ...(maybeMore ? { next_offset: off + data.length } : {}),
+            ...(maybeMore ? { next_offset: off + all.length } : {}),
+            ...(blocked > 0 ? { blocked_rows: blocked } : {}),
           },
-          hint: maybeMore ? `There may be more records. Call again with offset=${off + data.length}.` : undefined,
+          hint:
+            [maybeMore ? `There may be more records. Call again with offset=${off + all.length}.` : undefined, blockedNote(blocked)]
+              .filter(Boolean)
+              .join(" ") || undefined,
         },
         config.maxOutputChars,
       );
@@ -953,13 +972,16 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
 }
 
-export const SERVER_INSTRUCTIONS = `Read-only access to self-hosted Splunk across several environments.
+export const SERVER_INSTRUCTIONS = `Read-only access to one self-hosted Splunk instance. An "environment" is a fixed set of hosts on that instance.
 
 Rules:
 - Every tool needs "environment". If the user did not name one, call splunk_list_environments and ask. Never guess, never switch environment on your own.
-- A job id (sid) is only valid in the environment that created it.
-- splunk_search automatically adds the environment's default sourcetype/host and exclusion filters. meta.effective_query shows the SPL that actually ran. Do not repeat those filters yourself.
-- Explore before guessing: splunk_list_sourcetypes (kind=hosts or sourcetypes) shows what sends data, splunk_get_field_summary shows the available fields.
-- Always use a time range and aggregate in SPL (stats, timechart, top) instead of pulling raw events. Keep max_rows small.
+- Every search is automatically limited to the hosts of the chosen environment. This cannot be changed. Do not add host filters yourself.
+- Some hosts are blocked because their data is confidential. If you get BLOCKED_HOST or QUERY_NOT_ALLOWED, do not look for another way to reach that data; tell the user.
+- Write plain event searches: search terms, then pipes (stats, eval, where, rex, timechart, top, ...). No leading pipe, no subsearches in [ ], no macros, no append/join/tstats/inputlookup.
+- meta.effective_query shows the SPL that actually ran, including the default sourcetype and exclusion filters.
+- Explore before guessing: splunk_list_sourcetypes shows which logs exist, splunk_get_field_summary shows the available fields.
+- Always use a time range and aggregate in SPL instead of pulling raw events. Keep max_rows small.
 - When meta.truncated is true the result is incomplete: narrow the search or page with splunk_get_job_results.
+- A job id (sid) only works in the environment and session that created it.
 - On AUTH_FAILED or LOGIN_BLOCKED stop and tell the user. Do not retry.`;

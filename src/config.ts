@@ -2,18 +2,23 @@ import { SplunkMcpError } from "./errors.js";
 
 export type TlsMode = "pinned" | "verify" | "insecure";
 
-export interface EnvironmentConfig {
-  name: string;
+export interface ConnectionConfig {
   /** Management API base URL without trailing slash, e.g. https://host:8089 */
   url: string;
   /** Splunk Web base URL, used only to build links. */
   webUrl: string;
-  app: string;
   tlsMode: TlsMode;
   tlsFingerprint?: string;
   caCertPath?: string;
+}
+
+/** An environment is a host filter on the one Splunk instance. */
+export interface EnvironmentConfig {
+  name: string;
+  /** Host patterns of this environment (exact names or wildcards). Never empty. */
+  hosts: string[];
+  app: string;
   defaultSourcetype?: string;
-  defaultHost?: string;
   defaultIndex?: string;
   allowedIndexes: string[];
   excludeActuator: boolean;
@@ -22,7 +27,10 @@ export interface EnvironmentConfig {
 }
 
 export interface Config {
+  connection: ConnectionConfig;
   environments: Map<string, EnvironmentConfig>;
+  /** Hosts whose data must never be returned (e.g. production). Never empty. */
+  blockedHosts: string[];
   username?: string;
   passwordEnc?: string;
   secret?: string;
@@ -32,7 +40,7 @@ export interface Config {
   maxRows: number;
   maxOutputChars: number;
   searchTimeoutS: number;
-  allowRiskySpl: boolean;
+  enableKvstore: boolean;
   allowHttp: boolean;
   requestTimeoutMs: number;
   debug: boolean;
@@ -77,55 +85,98 @@ export function normalizeFingerprint(fp: string): string {
   return fp.replace(/[^0-9a-fA-F]/g, "").toUpperCase();
 }
 
+const HOST_PATTERN = /^[A-Za-z0-9_.\-*]+$/;
+
+/** Case-insensitive glob match where * matches any run of characters. */
+export function globMatch(pattern: string, value: string): boolean {
+  const re = new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`, "i");
+  return re.test(value);
+}
+
+function hostList(raw: string | undefined, variable: string): string[] {
+  const hosts = list(raw);
+  for (const h of hosts) {
+    if (!HOST_PATTERN.test(h)) {
+      throw new SplunkMcpError("CONFIG_ERROR", `${variable} contains an invalid host name: "${h}".`);
+    }
+  }
+  return hosts;
+}
+
 export function loadConfig(env: Env = process.env): Config {
-  const environments = new Map<string, EnvironmentConfig>();
   const allowHttp = bool(env.SPLUNK_ALLOW_HTTP, false);
-  const webPort = clean(env.SPLUNK_WEB_PORT) ?? "8443";
 
+  const rawUrl = clean(env.SPLUNK_URL);
+  if (!rawUrl) {
+    throw new SplunkMcpError("CONFIG_ERROR", "SPLUNK_URL is not set.", {
+      hint: "Set SPLUNK_URL to the management port, e.g. https://splunk.example.lan:8089",
+    });
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new SplunkMcpError("CONFIG_ERROR", `SPLUNK_URL is not a valid URL: "${rawUrl}".`);
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    throw new SplunkMcpError("CONFIG_ERROR", "SPLUNK_URL must start with https:// or http://.");
+  }
+  if (parsed.protocol === "http:" && !allowHttp) {
+    throw new SplunkMcpError("HTTP_NOT_ALLOWED", "SPLUNK_URL uses http://, which would send the password unencrypted.", {
+      hint: "Use https:// or set SPLUNK_ALLOW_HTTP=true if you accept that.",
+    });
+  }
+  const tlsModeRaw = (clean(env.SPLUNK_TLS_MODE) ?? "pinned").toLowerCase();
+  if (tlsModeRaw !== "pinned" && tlsModeRaw !== "verify" && tlsModeRaw !== "insecure") {
+    throw new SplunkMcpError("CONFIG_ERROR", "SPLUNK_TLS_MODE must be pinned, verify or insecure.");
+  }
+  const fp = clean(env.SPLUNK_TLS_FINGERPRINT);
+  const connection: ConnectionConfig = {
+    url: `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, "")}`,
+    webUrl:
+      clean(env.SPLUNK_WEB_URL)?.replace(/\/+$/, "") ??
+      `${parsed.protocol}//${parsed.hostname}:${clean(env.SPLUNK_WEB_PORT) ?? "8443"}`,
+    tlsMode: tlsModeRaw,
+    tlsFingerprint: fp ? normalizeFingerprint(fp) : undefined,
+    caCertPath: clean(env.SPLUNK_CA_CERT),
+  };
+
+  // The blocked hosts are mandatory: without them the protection would silently be off.
+  const blockedHosts = hostList(env.SPLUNK_BLOCKED_HOSTS, "SPLUNK_BLOCKED_HOSTS");
+  if (blockedHosts.length === 0) {
+    throw new SplunkMcpError("CONFIG_ERROR", "SPLUNK_BLOCKED_HOSTS is not set.", {
+      hint: "Set SPLUNK_BLOCKED_HOSTS to the production host(s) whose data must never be returned, comma separated.",
+    });
+  }
+  if (blockedHosts.some((h) => h.replace(/\*/g, "").length < 3)) {
+    throw new SplunkMcpError("CONFIG_ERROR", "Entries in SPLUNK_BLOCKED_HOSTS must contain at least 3 literal characters.");
+  }
+
+  const environments = new Map<string, EnvironmentConfig>();
   for (const [key, raw] of Object.entries(env)) {
-    const m = /^SPLUNK_URL_([A-Z0-9]+)$/.exec(key);
-    const value = clean(raw);
-    if (!m || !value) continue;
+    const m = /^SPLUNK_HOST_([A-Z0-9]+)$/.exec(key);
+    if (!m || !clean(raw)) continue;
     const name = m[1]!;
-
-    let parsed: URL;
-    try {
-      parsed = new URL(value);
-    } catch {
-      throw new SplunkMcpError("CONFIG_ERROR", `${key} is not a valid URL: "${value}".`);
+    const hosts = hostList(raw, key);
+    for (const h of hosts) {
+      if (h.replace(/\*/g, "") === "") {
+        throw new SplunkMcpError("CONFIG_ERROR", `${key} must not be a bare wildcard.`);
+      }
+      for (const b of blockedHosts) {
+        if (globMatch(h, b) || globMatch(b, h) || globMatch(h, b.replace(/\*/g, "")) || globMatch(b, h.replace(/\*/g, ""))) {
+          throw new SplunkMcpError(
+            "CONFIG_ERROR",
+            `${key} ("${h}") overlaps with a blocked host in SPLUNK_BLOCKED_HOSTS. Refusing to start.`,
+          );
+        }
+      }
     }
-    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-      throw new SplunkMcpError("CONFIG_ERROR", `${key} must start with https:// or http://.`);
-    }
-    if (parsed.protocol === "http:" && !allowHttp) {
-      throw new SplunkMcpError(
-        "HTTP_NOT_ALLOWED",
-        `${key} uses http://, which would send the password unencrypted.`,
-        { hint: "Use https:// or set SPLUNK_ALLOW_HTTP=true if you accept that." },
-      );
-    }
-
-    const tlsModeRaw = (scoped(env, "SPLUNK_TLS_MODE", name) ?? "pinned").toLowerCase();
-    if (tlsModeRaw !== "pinned" && tlsModeRaw !== "verify" && tlsModeRaw !== "insecure") {
-      throw new SplunkMcpError("CONFIG_ERROR", `SPLUNK_TLS_MODE for ${name} must be pinned, verify or insecure.`);
-    }
-
-    const fp = clean(env[`SPLUNK_TLS_FINGERPRINT_${name}`]);
-    const webUrl =
-      clean(env[`SPLUNK_WEB_URL_${name}`])?.replace(/\/+$/, "") ??
-      `${parsed.protocol}//${parsed.hostname}:${webPort}`;
-
     environments.set(name, {
       name,
-      url: `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, "")}`,
-      webUrl,
+      hosts,
       app: scoped(env, "SPLUNK_APP", name) ?? "search",
-      tlsMode: tlsModeRaw,
-      tlsFingerprint: fp ? normalizeFingerprint(fp) : undefined,
-      caCertPath: scoped(env, "SPLUNK_CA_CERT", name),
-      defaultSourcetype: clean(env[`SPLUNK_SOURCETYPE_${name}`]),
-      defaultHost: clean(env[`SPLUNK_HOST_${name}`]),
-      defaultIndex: clean(env[`SPLUNK_INDEX_${name}`]),
+      defaultSourcetype: scoped(env, "SPLUNK_SOURCETYPE", name),
+      defaultIndex: scoped(env, "SPLUNK_INDEX", name),
       allowedIndexes: list(scoped(env, "SPLUNK_ALLOWED_INDEXES", name)),
       excludeActuator: bool(scoped(env, "SPLUNK_EXCLUDE_ACTUATOR", name), false),
       actuatorField: scoped(env, "SPLUNK_ACTUATOR_FIELD", name),
@@ -134,11 +185,9 @@ export function loadConfig(env: Env = process.env): Config {
   }
 
   if (environments.size === 0) {
-    throw new SplunkMcpError(
-      "CONFIG_ERROR",
-      "No Splunk environment configured.",
-      { hint: "Set at least one SPLUNK_URL_<NAME>, e.g. SPLUNK_URL_TEST=https://splunk-test.example.lan:8089" },
-    );
+    throw new SplunkMcpError("CONFIG_ERROR", "No environment configured.", {
+      hint: "Set at least one SPLUNK_HOST_<NAME>, e.g. SPLUNK_HOST_INT1=inthost01",
+    });
   }
 
   const token = clean(env.SPLUNK_TOKEN);
@@ -165,7 +214,9 @@ export function loadConfig(env: Env = process.env): Config {
   const sorted = new Map([...environments.entries()].sort(([a], [b]) => a.localeCompare(b)));
 
   return {
+    connection,
     environments: sorted,
+    blockedHosts,
     username,
     passwordEnc,
     secret,
@@ -175,7 +226,7 @@ export function loadConfig(env: Env = process.env): Config {
     maxRows: int(env.SPLUNK_MAX_ROWS, 1000, "SPLUNK_MAX_ROWS"),
     maxOutputChars: int(env.SPLUNK_MAX_OUTPUT_CHARS, 40000, "SPLUNK_MAX_OUTPUT_CHARS"),
     searchTimeoutS: int(env.SPLUNK_SEARCH_TIMEOUT_S, 120, "SPLUNK_SEARCH_TIMEOUT_S"),
-    allowRiskySpl: bool(env.SPLUNK_ALLOW_RISKY_SPL, false),
+    enableKvstore: bool(env.SPLUNK_ENABLE_KVSTORE, false),
     allowHttp,
     requestTimeoutMs: int(env.SPLUNK_REQUEST_TIMEOUT_MS, 60000, "SPLUNK_REQUEST_TIMEOUT_MS"),
     debug: bool(env.SPLUNK_DEBUG, false),

@@ -11,8 +11,7 @@ const HELP = `splunk-mcp ${VERSION} – read-only MCP server for self-hosted Spl
 Usage:
   splunk-mcp                         Start the MCP server on stdio (used by Gemini CLI)
   splunk-mcp encrypt [--secret <s>]  Encrypt the Splunk password for settings.json
-  splunk-mcp fingerprint <NAME> [url]
-                                     Show the TLS certificate fingerprint of an environment
+  splunk-mcp fingerprint [url]       Show the TLS certificate fingerprint of the Splunk server
   splunk-mcp check                   Validate the configuration from the environment variables
   splunk-mcp --help | --version
 `;
@@ -71,10 +70,8 @@ async function cmdEncrypt(args: string[]): Promise<void> {
 }
 
 async function cmdFingerprint(args: string[]): Promise<void> {
-  const name = args[0]?.toUpperCase();
-  if (!name) throw new Error("Aufruf: splunk-mcp fingerprint <NAME> [url]");
-  const raw = args[1] ?? process.env[`SPLUNK_URL_${name}`];
-  if (!raw) throw new Error(`Keine URL angegeben und SPLUNK_URL_${name} ist nicht gesetzt.\nAufruf: splunk-mcp fingerprint ${name} https://host:8089`);
+  const raw = args[0] ?? process.env.SPLUNK_URL;
+  if (!raw) throw new Error("Aufruf: splunk-mcp fingerprint https://host:8089");
   const url = new URL(raw.includes("://") ? raw : `https://${raw}`);
   if (url.protocol !== "https:") throw new Error("Nur https://-Adressen haben ein Zertifikat.");
   const port = Number(url.port || 443);
@@ -86,25 +83,26 @@ async function cmdFingerprint(args: string[]): Promise<void> {
       `  Gültig:     ${cert.validFrom}  bis  ${cert.validTo}\n\n` +
       `Bitte prüfen, ob das der erwartete Server ist. Dann in settings.json eintragen:\n\n`,
   );
-  process.stdout.write(`"SPLUNK_TLS_FINGERPRINT_${name}": "${cert.fingerprint256}",\n`);
+  process.stdout.write(`"SPLUNK_TLS_FINGERPRINT": "${cert.fingerprint256}",\n`);
 }
 
 function cmdCheck(): void {
   const config = loadConfig();
   if (config.passwordEnc && config.secret) decryptPassword(config.passwordEnc, config.secret);
-  process.stdout.write(`Konfiguration ist gültig. Umgebungen:\n`);
+  const c = config.connection;
+  const tlsInfo = c.url.startsWith("http://")
+    ? "http (unverschlüsselt)"
+    : c.tlsMode === "pinned"
+      ? c.tlsFingerprint
+        ? "pinned"
+        : "pinned, ABER SPLUNK_TLS_FINGERPRINT FEHLT"
+      : c.tlsMode;
+  process.stdout.write(`Konfiguration ist gültig.\n  Splunk:           ${c.url}  (tls=${tlsInfo})\n`);
+  process.stdout.write(`  Gesperrte Hosts:  ${config.blockedHosts.join(", ")}\n  Umgebungen:\n`);
   for (const e of config.environments.values()) {
-    const tlsInfo = e.url.startsWith("http://")
-      ? "http (unverschlüsselt)"
-      : e.tlsMode === "pinned"
-        ? e.tlsFingerprint
-          ? "pinned"
-          : "pinned, ABER FINGERPRINT FEHLT"
-        : e.tlsMode;
     process.stdout.write(
-      `  ${e.name.padEnd(8)} ${e.url}  app=${e.app}  tls=${tlsInfo}` +
+      `    ${e.name.padEnd(8)} hosts=${e.hosts.join(",")}  app=${e.app}` +
         `${e.defaultSourcetype ? `  sourcetype=${e.defaultSourcetype}` : ""}` +
-        `${e.defaultHost ? `  host=${e.defaultHost}` : ""}` +
         `${e.excludeActuator ? "  actuator=ausgeblendet" : ""}\n`,
     );
   }
@@ -117,7 +115,7 @@ async function cmdServe(): Promise<void> {
   const { server, pool } = createServer(config);
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log(`v${VERSION} ready. Environments: ${[...config.environments.keys()].join(", ")}`);
+  log(`v${VERSION} ready. Environments: ${[...config.environments.keys()].join(", ")}. Blocked hosts: ${config.blockedHosts.length}.`);
   const shutdown = () => {
     pool.closeAll();
     process.exit(0);

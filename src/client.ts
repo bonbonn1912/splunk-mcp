@@ -2,7 +2,7 @@ import http from "node:http";
 import https from "node:https";
 import tls from "node:tls";
 import { readFileSync } from "node:fs";
-import type { Config, EnvironmentConfig } from "./config.js";
+import type { Config, ConnectionConfig, EnvironmentConfig } from "./config.js";
 import { log, normalizeFingerprint } from "./config.js";
 import { decryptPassword } from "./crypto.js";
 import { SplunkMcpError } from "./errors.js";
@@ -21,15 +21,15 @@ interface RawResponse {
 
 /** Shared across all environments: the same AD password is used everywhere. */
 export class LoginGate {
-  private blockedBy?: string;
-  block(environment: string): void {
-    this.blockedBy = environment;
+  private blocked = false;
+  block(): void {
+    this.blocked = true;
   }
   assertOpen(): void {
-    if (this.blockedBy) {
+    if (this.blocked) {
       throw new SplunkMcpError(
         "LOGIN_BLOCKED",
-        `Login was rejected in ${this.blockedBy}. Further logins are blocked in all environments to avoid locking the account.`,
+        "Splunk rejected the login. Further logins are blocked to avoid locking the account.",
         {
           hint: "Do not retry. Tell the user to check the password (run `node dist/cli.js encrypt` again) and restart the MCP server.",
         },
@@ -88,7 +88,6 @@ export function fetchCertificate(host: string, port: number, timeoutMs = 10000):
 class PinnedAgent extends https.Agent {
   constructor(
     private readonly expected: string,
-    private readonly envName: string,
   ) {
     super({ keepAlive: true, maxSockets: 4 });
   }
@@ -121,9 +120,9 @@ class PinnedAgent extends https.Agent {
         done(
           new SplunkMcpError(
             "TLS_FINGERPRINT_MISMATCH",
-            `The certificate of ${this.envName} does not match the pinned fingerprint. Nothing was sent.`,
+            "The Splunk certificate does not match the pinned fingerprint. Nothing was sent.",
             {
-              hint: `Tell the user. If the certificate was replaced on purpose, run \`node dist/cli.js fingerprint ${this.envName}\` and update SPLUNK_TLS_FINGERPRINT_${this.envName}.`,
+              hint: "Tell the user. If the certificate was replaced on purpose, run `node dist/cli.js fingerprint` and update SPLUNK_TLS_FINGERPRINT.",
             },
           ),
         );
@@ -135,34 +134,30 @@ class PinnedAgent extends https.Agent {
   }
 }
 
-function buildAgent(env: EnvironmentConfig): http.Agent | https.Agent {
-  if (env.url.startsWith("http://")) return new http.Agent({ keepAlive: true, maxSockets: 4 });
-  switch (env.tlsMode) {
+function buildAgent(conn: ConnectionConfig): http.Agent | https.Agent {
+  if (conn.url.startsWith("http://")) return new http.Agent({ keepAlive: true, maxSockets: 4 });
+  switch (conn.tlsMode) {
     case "pinned": {
-      if (!env.tlsFingerprint) {
-        throw new SplunkMcpError(
-          "TLS_FINGERPRINT_MISSING",
-          `No certificate fingerprint configured for ${env.name}.`,
-          {
-            hint: `Tell the user to run \`node dist/cli.js fingerprint ${env.name} ${env.url}\` and add SPLUNK_TLS_FINGERPRINT_${env.name} to settings.json (or set SPLUNK_TLS_MODE_${env.name}=insecure).`,
-          },
-        );
+      if (!conn.tlsFingerprint) {
+        throw new SplunkMcpError("TLS_FINGERPRINT_MISSING", "No certificate fingerprint configured.", {
+          hint: `Tell the user to run \`node dist/cli.js fingerprint ${conn.url}\` and add SPLUNK_TLS_FINGERPRINT to settings.json (or set SPLUNK_TLS_MODE=insecure).`,
+        });
       }
-      return new PinnedAgent(env.tlsFingerprint, env.name);
+      return new PinnedAgent(conn.tlsFingerprint);
     }
     case "verify": {
       let ca: Buffer | undefined;
-      if (env.caCertPath) {
+      if (conn.caCertPath) {
         try {
-          ca = readFileSync(env.caCertPath);
+          ca = readFileSync(conn.caCertPath);
         } catch {
-          throw new SplunkMcpError("CONFIG_ERROR", `Cannot read CA certificate file: ${env.caCertPath}`);
+          throw new SplunkMcpError("CONFIG_ERROR", `Cannot read CA certificate file: ${conn.caCertPath}`);
         }
       }
       return new https.Agent({ keepAlive: true, maxSockets: 4, ca });
     }
     case "insecure":
-      log(`WARNING: TLS certificate of ${env.name} is not verified (SPLUNK_TLS_MODE=insecure).`);
+      log("WARNING: the Splunk TLS certificate is not verified (SPLUNK_TLS_MODE=insecure).");
       return new https.Agent({ keepAlive: true, maxSockets: 4, rejectUnauthorized: false });
   }
 }
@@ -176,26 +171,28 @@ function splunkMessages(body: string): string[] {
   }
 }
 
-export class SplunkClient {
+/** The one connection to Splunk: TLS, login and session. Shared by all environments. */
+export class Connection {
   private agent?: http.Agent | https.Agent;
   private sessionKey?: string;
   private loginInFlight?: Promise<string>;
   private usernameCache?: string;
   sessionState: "none" | "active" | "failed" = "none";
 
-  constructor(
-    readonly env: EnvironmentConfig,
-    private readonly config: Config,
-    private readonly gate: LoginGate,
-  ) {}
+  private readonly gate = new LoginGate();
+  private readonly conn: ConnectionConfig;
+
+  constructor(private readonly config: Config) {
+    this.conn = config.connection;
+  }
 
   private getAgent(): http.Agent | https.Agent {
-    this.agent ??= buildAgent(this.env);
+    this.agent ??= buildAgent(this.conn);
     return this.agent;
   }
 
   private send(method: string, path: string, headers: Record<string, string>, body?: string): Promise<RawResponse> {
-    const url = new URL(this.env.url + path);
+    const url = new URL(this.conn.url + path);
     const isHttps = url.protocol === "https:";
     const agent = this.getAgent();
     return new Promise<RawResponse>((resolve, reject) => {
@@ -222,7 +219,7 @@ export class SplunkClient {
           res.on("error", reject);
         },
       );
-      req.on("timeout", () => req.destroy(new SplunkMcpError("UNREACHABLE", `Request to ${this.env.name} timed out.`)));
+      req.on("timeout", () => req.destroy(new SplunkMcpError("UNREACHABLE", "Request to Splunk timed out.")));
       req.on("error", (err) => reject(this.mapNetworkError(err)));
       if (body !== undefined) req.write(body);
       req.end();
@@ -240,14 +237,14 @@ export class SplunkClient {
       code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" ||
       code === "ERR_TLS_CERT_ALTNAME_INVALID"
     ) {
-      return new SplunkMcpError("TLS_ERROR", `TLS certificate of ${this.env.name} is not trusted (${code}).`, {
-        hint: `Set SPLUNK_TLS_MODE_${this.env.name}=pinned with a fingerprint, or provide SPLUNK_CA_CERT.`,
+      return new SplunkMcpError("TLS_ERROR", `The Splunk TLS certificate is not trusted (${code}).`, {
+        hint: "Set SPLUNK_TLS_MODE=pinned with SPLUNK_TLS_FINGERPRINT, or provide SPLUNK_CA_CERT.",
       });
     }
     return new SplunkMcpError(
       "UNREACHABLE",
-      `Cannot reach ${this.env.name} at ${this.env.url}${code ? ` (${code})` : ""}: ${e.message}`,
-      { hint: `Check SPLUNK_URL_${this.env.name}, the port and VPN/network access. Do not retry in a loop.` },
+      `Cannot reach Splunk at ${this.conn.url}${code ? ` (${code})` : ""}: ${e.message}`,
+      { hint: "Check SPLUNK_URL, the port and VPN/network access. Do not retry in a loop." },
     );
   }
 
@@ -270,13 +267,13 @@ export class SplunkClient {
     }
     this.sessionState = "failed";
     if (res.status === 401 || res.status === 403) {
-      this.gate.block(this.env.name);
-      throw new SplunkMcpError("AUTH_FAILED", `Splunk rejected the login in ${this.env.name}.`, {
+      this.gate.block();
+      throw new SplunkMcpError("AUTH_FAILED", "Splunk rejected the login.", {
         splunkMessages: splunkMessages(res.body),
         hint: "Do not retry. The password may be wrong, expired or the account locked. Tell the user to run `node dist/cli.js encrypt` again and restart the MCP server.",
       });
     }
-    throw new SplunkMcpError("SPLUNK_ERROR", `Login in ${this.env.name} failed with HTTP ${res.status}.`, {
+    throw new SplunkMcpError("SPLUNK_ERROR", `Login failed with HTTP ${res.status}.`, {
       splunkMessages: splunkMessages(res.body),
     });
   }
@@ -330,7 +327,7 @@ export class SplunkClient {
 
     const started = Date.now();
     const res = await this.sendAuthed(method, fullPath, body);
-    if (this.config.debug) log(`${this.env.name} ${method} ${path} -> ${res.status} (${Date.now() - started} ms)`);
+    if (this.config.debug) log(`${method} ${path} -> ${res.status} (${Date.now() - started} ms)`);
 
     if (res.status >= 200 && res.status < 300) {
       if (!res.body) return {} as T;
@@ -350,23 +347,23 @@ export class SplunkClient {
           hint: "Read the Splunk message, fix the query or parameters and try again.",
         });
       case 401:
-        throw new SplunkMcpError("AUTH_FAILED", `Not authenticated in ${this.env.name}: ${detail}`, {
+        throw new SplunkMcpError("AUTH_FAILED", `Not authenticated: ${detail}`, {
           splunkMessages: messages,
           hint: "Do not retry. Tell the user the credentials are not accepted.",
         });
       case 402:
       case 403:
-        throw new SplunkMcpError("FORBIDDEN", `Not permitted in ${this.env.name}: ${detail}`, {
+        throw new SplunkMcpError("FORBIDDEN", `Not permitted: ${detail}`, {
           splunkMessages: messages,
           hint: "The user's Splunk role lacks a capability or index access. Call splunk_get_current_user to see the roles.",
         });
       case 404:
-        throw new SplunkMcpError("NOT_FOUND", `Not found in ${this.env.name}: ${detail}`, {
+        throw new SplunkMcpError("NOT_FOUND", `Not found: ${detail}`, {
           splunkMessages: messages,
-          hint: "Check the name (list the objects first). Job ids (sid) are only valid in the environment that created them and expire.",
+          hint: "Check the name (list the objects first). Job ids (sid) expire after a while.",
         });
       default:
-        throw new SplunkMcpError("SPLUNK_ERROR", `Splunk error (HTTP ${res.status}) in ${this.env.name}: ${detail}`, {
+        throw new SplunkMcpError("SPLUNK_ERROR", `Splunk error (HTTP ${res.status}): ${detail}`, {
           splunkMessages: messages,
         });
     }
@@ -399,11 +396,30 @@ export class SplunkClient {
   }
 }
 
-export class ClientPool {
-  private readonly clients = new Map<string, SplunkClient>();
-  private readonly gate = new LoginGate();
+/** What a tool works with: the shared connection plus the chosen environment. */
+export class SplunkClient {
+  constructor(
+    readonly env: EnvironmentConfig,
+    private readonly connection: Connection,
+  ) {}
+  get<T = unknown>(path: string, query?: RequestOptions["query"], rawJson = false): Promise<T> {
+    return this.connection.get<T>(path, query, rawJson);
+  }
+  post<T = unknown>(path: string, form?: RequestOptions["form"]): Promise<T> {
+    return this.connection.post<T>(path, form);
+  }
+  username(): Promise<string> {
+    return this.connection.username();
+  }
+}
 
-  constructor(private readonly config: Config) {}
+export class ClientPool {
+  readonly connection: Connection;
+  private readonly clients = new Map<string, SplunkClient>();
+
+  constructor(private readonly config: Config) {
+    this.connection = new Connection(config);
+  }
 
   get(environment: string): SplunkClient {
     const name = environment.trim().toUpperCase();
@@ -415,18 +431,14 @@ export class ClientPool {
     }
     let client = this.clients.get(name);
     if (!client) {
-      client = new SplunkClient(env, this.config, this.gate);
+      client = new SplunkClient(env, this.connection);
       this.clients.set(name, client);
     }
     return client;
   }
 
-  sessionState(name: string): "none" | "active" | "failed" {
-    return this.clients.get(name)?.sessionState ?? "none";
-  }
-
   closeAll(): void {
-    for (const c of this.clients.values()) c.close();
+    this.connection.close();
   }
 }
 
