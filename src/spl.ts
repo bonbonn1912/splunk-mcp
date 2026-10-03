@@ -189,17 +189,17 @@ const WILDCARD_FIELD_COMMANDS = new Set([
 /** Removes balanced function calls while respecting quoted strings and nesting. */
 function removeFunctionCalls(text: string, functionName: string, visit?: (call: string) => void): string {
   let out = "";
-  let inQuote = false;
+  let quote: string | undefined;
   let copiedFrom = 0;
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
-    if (inQuote) {
+    if (quote) {
       if (c === "\\") i++;
-      else if (c === '"') inQuote = false;
+      else if (c === quote) quote = undefined;
       continue;
     }
-    if (c === '"') {
-      inQuote = true;
+    if (c === '"' || c === "'") {
+      quote = c;
       continue;
     }
     if (text.slice(i, i + functionName.length).toLowerCase() !== functionName.toLowerCase()) continue;
@@ -209,14 +209,14 @@ function removeFunctionCalls(text: string, functionName: string, visit?: (call: 
     while (/\s/.test(text[open] ?? "")) open++;
     if (text[open] !== "(") continue;
     let depth = 1;
-    let quoted = false;
+    let quoted: string | undefined;
     let end = open + 1;
     for (; end < text.length && depth > 0; end++) {
       const d = text[end]!;
       if (quoted) {
         if (d === "\\") end++;
-        else if (d === '"') quoted = false;
-      } else if (d === '"') quoted = true;
+        else if (d === quoted) quoted = undefined;
+      } else if (d === '"' || d === "'") quoted = d;
       else if (d === "(") depth++;
       else if (d === ")") depth--;
     }

@@ -54,8 +54,18 @@ test("safe named grouping and aggregations remain available with pseudonymisatio
   assert.doesNotThrow(() => validateQuery("* | stats sum(eval(bytes*8)) by lastName", env(), redactor));
   assert.throws(() => validateQuery("* | stats values(eval(lastName*8)) by host", env(), redactor), { code: "QUERY_NOT_ALLOWED" });
   assert.doesNotThrow(() => validateQuery("* | eval scaled=bytes*8", env(), redactor));
+  assert.doesNotThrow(() => validateQuery("* | stats sum(eval('byte-count'*8)) by host", env(), redactor));
   assert.throws(() => validateQuery('* | stats sum(eval(bytes*8)), list("last*") AS public', env(), redactor), { code: "QUERY_NOT_ALLOWED" });
   assert.throws(() => validateQuery("* | fields customerId | addtotals fieldname=public | table public", env(), new Redactor({ keys: ["customerId"] })), { code: "QUERY_NOT_ALLOWED" });
+});
+
+test("single-quoted field parentheses cannot hide sibling wildcard aggregates", () => {
+  for (const query of [
+    "x | stats sum(eval('((' + 1)) values(last*) AS pub* sum(eval('))' + 1))",
+    "x | chart sum(eval('((' + 1)) values(last*) AS pub* sum(eval('))' + 1)) by host",
+  ]) {
+    assert.throws(() => validateQuery(query, env(), redactor), { code: "QUERY_NOT_ALLOWED" }, query);
+  }
 });
 
 test("lookup is rejected as a query command", () => {
