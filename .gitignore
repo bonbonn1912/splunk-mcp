@@ -3,4 +3,7 @@ dist/
 *.log
 .env
 .env.*
+!.env.example
+environments.json
+redaction.json
 .gemini/settings.json

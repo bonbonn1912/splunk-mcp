@@ -98,6 +98,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
         {
           data: [...config.environments.values()].map((e) => ({
             name: e.name,
+            description: e.description,
             hosts: e.hosts,
             app: e.app,
             default_sourcetype: e.defaultSourcetype ?? null,

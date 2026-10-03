@@ -1,4 +1,5 @@
 import { SplunkMcpError } from "./errors.js";
+import { withConfigFiles } from "./files.js";
 import { Redactor } from "./redact.js";
 
 export type TlsMode = "pinned" | "verify" | "insecure";
@@ -16,6 +17,8 @@ export interface ConnectionConfig {
 /** An environment is a host filter on the one Splunk instance. */
 export interface EnvironmentConfig {
   name: string;
+  /** Free text that tells the model what the environment is for. */
+  description: string;
   /** Host patterns of this environment (exact names or wildcards). Never empty. */
   hosts: string[];
   /** Hosts that must never appear in results of this environment. */
@@ -112,13 +115,18 @@ function hostList(raw: string | undefined, variable: string): string[] {
   return hosts;
 }
 
-export function loadConfig(env: Env = process.env): Config {
+/**
+ * Loads the configuration. When called for the real process environment, the
+ * files in the project folder (.env, environments.json, redaction.json) are read too.
+ */
+export function loadConfig(rawEnv: Env = process.env, readFiles = rawEnv === process.env): Config {
+  const env = readFiles ? withConfigFiles(rawEnv) : rawEnv;
   const allowHttp = bool(env.SPLUNK_ALLOW_HTTP, false);
 
   const rawUrl = clean(env.SPLUNK_URL);
   if (!rawUrl) {
-    throw new SplunkMcpError("CONFIG_ERROR", "SPLUNK_URL is not set.", {
-      hint: "Set SPLUNK_URL to the management port, e.g. https://splunk.example.lan:8089",
+    throw new SplunkMcpError("CONFIG_ERROR", "The Splunk address is not configured.", {
+      hint: 'Create environments.json in the project folder (see environments.example.json) with "splunk": { "url": "https://splunk.example.lan:8089" }.',
     });
   }
   let parsed: URL;
@@ -159,7 +167,7 @@ export function loadConfig(env: Env = process.env): Config {
   // The production host must be declared one way or the other: without it the protection would silently be off.
   if (blockedHosts.length === 0 && protectedHosts.length === 0) {
     throw new SplunkMcpError("CONFIG_ERROR", "Neither SPLUNK_BLOCKED_HOSTS nor SPLUNK_PROTECTED_HOSTS is set.", {
-      hint: "Name the production host(s): SPLUNK_BLOCKED_HOSTS = never accessible; SPLUNK_PROTECTED_HOSTS = accessible only with pseudonymisation (SPLUNK_REDACTION_FILE).",
+      hint: 'Name the production host(s) in environments.json: "blockedHosts" = never accessible; "protectedHosts" = accessible only with pseudonymisation (redaction.json).',
     });
   }
   if ([...blockedHosts, ...protectedHosts].some((h) => h.replace(/\*/g, "").length < 3)) {
@@ -195,6 +203,7 @@ export function loadConfig(env: Env = process.env): Config {
     }
     environments.set(name, {
       name,
+      description: clean(env[`SPLUNK_DESCRIPTION_${name}`]) ?? "",
       hosts,
       // Protected hosts that do not belong to this environment are blocked in it.
       blockedHosts: [...blockedHosts, ...protectedHosts.filter((p) => !touched.includes(p))],
@@ -211,7 +220,7 @@ export function loadConfig(env: Env = process.env): Config {
 
   if (environments.size === 0) {
     throw new SplunkMcpError("CONFIG_ERROR", "No environment configured.", {
-      hint: "Set at least one SPLUNK_HOST_<NAME>, e.g. SPLUNK_HOST_INT1=inthost01",
+      hint: 'Add at least one entry under "environments" in environments.json, e.g. "INT1": { "hosts": ["inthost01"] }.',
     });
   }
 
@@ -224,14 +233,14 @@ export function loadConfig(env: Env = process.env): Config {
     throw new SplunkMcpError(
       "CONFIG_ERROR",
       "SPLUNK_PASSWORD (plain text) is not supported.",
-      { hint: "Run `node dist/cli.js encrypt` and set SPLUNK_PASSWORD_ENC and SPLUNK_SECRET instead." },
+      { hint: "Run `node dist/cli.js encrypt --write`; it stores SPLUNK_PASSWORD_ENC and SPLUNK_SECRET in .env." },
     );
   }
   if (!token && !(username && passwordEnc && secret)) {
     throw new SplunkMcpError(
       "CONFIG_ERROR",
-      "Credentials missing: set SPLUNK_USERNAME, SPLUNK_PASSWORD_ENC and SPLUNK_SECRET (or SPLUNK_TOKEN).",
-      { hint: "Run `node dist/cli.js encrypt` to create SPLUNK_PASSWORD_ENC and SPLUNK_SECRET." },
+      'Credentials missing: "splunk.user" in environments.json plus SPLUNK_PASSWORD_ENC and SPLUNK_SECRET in .env.',
+      { hint: "Run `node dist/cli.js encrypt --write` to store the encrypted password in .env." },
     );
   }
 

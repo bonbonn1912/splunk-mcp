@@ -17,74 +17,142 @@ npm install
 npm run build
 ```
 
-### 1. Passwort verschlüsseln
+Danach gibt es drei Dateien, dazu optional eine vierte:
 
-```bash
-node dist/cli.js encrypt
-```
+| Datei | Ort | Inhalt |
+|---|---|---|
+| `settings.json` | `~/.gemini/` oder `.gemini/` im Projekt | startet den MCP-Server |
+| `environments.json` | Projektordner, neben `dist/` | Splunk-Adresse, Hosts der Umgebungen, gesperrte Hosts |
+| `.env` | Projektordner, neben `dist/` | das verschlüsselte Passwort |
+| `redaction.json` (optional) | Projektordner, neben `dist/` | Regeln für die Pseudonymisierung |
 
-Fragt das Passwort verdeckt ab und gibt `SPLUNK_PASSWORD_ENC` und `SPLUNK_SECRET` aus.
+`environments.json`, `.env` und `redaction.json` stehen in `.gitignore`. Vorlagen: `gemini-settings.example.json`,
+`environments.example.json`, `.env.example`, `redaction.example.json`. Nach Änderungen an den Dateien den MCP-Server in Gemini neu starten
+(`/mcp refresh` oder Gemini neu starten).
 
-### 2. Zertifikats-Fingerprint holen
-
-```bash
-node dist/cli.js fingerprint https://splunk.example.lan:8089
-```
-
-Zeigt Inhaber und Gültigkeit des Zertifikats und gibt die Zeile `SPLUNK_TLS_FINGERPRINT` aus.
-
-### 3. In die Gemini CLI eintragen
-
-`~/.gemini/settings.json`:
+### 1. `settings.json`
 
 ```json
 {
   "mcpServers": {
     "splunk": {
       "command": "node",
-      "args": ["/Users/dominik/Developer/github/splunk-mcp/dist/cli.js"],
-      "env": {
-        "SPLUNK_URL": "https://splunk.example.lan:8089",
-        "SPLUNK_TLS_FINGERPRINT": "AB:CD:…",
-
-        "SPLUNK_USERNAME": "dein.benutzer",
-        "SPLUNK_PASSWORD_ENC": "v1:…",
-        "SPLUNK_SECRET": "…",
-
-        "SPLUNK_APP": "meine_app",
-        "SPLUNK_SOURCETYPE": "mein:sourcetype",
-        "SPLUNK_EXCLUDE_ACTUATOR": "true",
-
-        "SPLUNK_HOST_TEST": "testhost01",
-        "SPLUNK_HOST_TEST2": "testhost02",
-        "SPLUNK_HOST_INT1": "inthost01",
-        "SPLUNK_HOST_INT2": "inthost02",
-        "SPLUNK_HOST_DEMO": "demohost01",
-
-        "SPLUNK_BLOCKED_HOSTS": "prodhost01"
-      },
-      "timeout": 180000
+      "args": ["dist/cli.js"],
+      "cwd": "/path/to/splunk-mcp",
+      "timeout": 180000,
+      "trust": false
     }
   }
 }
 ```
 
-- `SPLUNK_HOST_<NAME>` legt eine Umgebung an. Mehrere Hosts als Kommaliste, Wildcards wie `int-*` sind möglich.
-- `SPLUNK_BLOCKED_HOSTS` nennt den oder die PROD-Hosts, kommagetrennt, Wildcards möglich. Ohne diese Angabe (oder `SPLUNK_PROTECTED_HOSTS`, siehe unten) startet der Server nicht.
+`cwd` ist der Projektordner. Ein `env`-Block ist nicht nötig.
 
-Danach `chmod 600 ~/.gemini/settings.json`. Die Zugangsdaten gehören nur in diese Benutzer-Datei, nie in eine `settings.json` im Repo.
+### 2. `environments.json`
 
-### 4. Prüfen
+```json
+{
+  "splunk": {
+    "url": "https://splunk.example.lan:8089",
+    "tlsFingerprint": "AB:CD:EF:…",
+    "user": "dein.benutzer"
+  },
 
-In der Gemini CLI `/mcp` aufrufen: Der Server `splunk` sollte 18 Tools zeigen. Dann z. B.:
+  "app": "meine_app",
+  "sourcetype": "mein:sourcetype",
+  "excludeActuator": true,
+
+  "environments": {
+    "TEST": { "description": "Testumgebung 1", "hosts": ["testhost01"] },
+    "TEST2": { "description": "Testumgebung 2", "hosts": ["testhost02"] },
+    "INT1": { "description": "Integration 1", "hosts": ["inthost01"] },
+    "INT2": { "description": "Integration 2", "hosts": ["inthost02"] },
+    "DEMO": { "description": "Demo-Umgebung", "hosts": ["demohost01"] }
+  },
+
+  "blockedHosts": ["prodhost01"]
+}
+```
+
+Der Name eines Eintrags unter `environments` ist der Name, unter dem die KI die Umgebung anspricht: Buchstaben und Ziffern,
+Groß-/Kleinschreibung egal. Weitere Umgebungen sind einfach weitere Einträge.
+
+**`splunk`: die Verbindung**
+
+| Feld | Pflicht | Bedeutung |
+|---|---|---|
+| `url` | ja | Management-Port, z. B. `https://splunk.example.lan:8089` |
+| `user` | ja | Splunk- bzw. AD-Benutzername |
+| `tlsFingerprint` | bei `tlsMode: pinned` | SHA-256-Fingerprint des Zertifikats, siehe Schritt 4 |
+| `tlsMode` | nein | `pinned` (Standard), `verify` oder `insecure` |
+| `caCert` | nein | Pfad zur CA-Datei, nur für `verify` |
+| `allowHttp` | nein | `true` erlaubt eine `http://`-Adresse |
+| `webPort`, `webUrl`, `locale` | nein | für den Link in die Splunk-Oberfläche; Standard Port `8443`, `de-DE` |
+
+**`environments.<NAME>`: eine Umgebung**
+
+| Feld | Pflicht | Bedeutung |
+|---|---|---|
+| `hosts` | ja | Host oder Hosts der Umgebung; Liste, Wildcards wie `int-*` möglich |
+| `description` | nein | Beschreibung; daran erkennt die KI, welche Umgebung gemeint ist |
+| `app`, `sourcetype`, `index`, `excludeActuator`, `actuatorField`, `excludeTerms`, `allowedIndexes` | nein | überschreibt den Wert der obersten Ebene für diese Umgebung |
+
+**Oberste Ebene: gilt für alle Umgebungen**
+
+| Feld | Pflicht | Bedeutung |
+|---|---|---|
+| `blockedHosts` | ja* | Hosts, deren Daten nie ausgegeben werden (PROD) |
+| `protectedHosts` | ja* | Hosts, die nur pseudonymisiert durchsucht werden dürfen |
+| `app` | nein | Splunk-App, Standard `search` |
+| `sourcetype`, `index` | nein | wird vor jede Suche gesetzt |
+| `excludeActuator` | nein | `true` blendet Spring-`/actuator`-Aufrufe aus |
+| `actuatorField`, `excludeTerms` | nein | Feld mit dem Request-Pfad; weitere auszublendende Begriffe |
+| `redactionFile` | nein | anderer Pfad für die Pseudonymisierungs-Datei |
+| `maxRows`, `maxOutputChars`, `searchTimeoutS`, `defaultEarliest`, `enableKvstore` | nein | Grenzwerte, siehe [tools.md](tools.md) |
+
+\* Eines von beiden muss gesetzt sein, sonst startet der Server nicht.
+
+Ein unbekannter Eintrag (Tippfehler) ist ein Fehler: Der Server startet nicht und nennt den Eintrag.
+
+### 3. `.env`
+
+```bash
+node dist/cli.js encrypt --write
+```
+
+Fragt das Passwort verdeckt ab und schreibt zwei Zeilen in die `.env` (nur für dich lesbar):
+
+```
+SPLUNK_PASSWORD_ENC=v1:...
+SPLUNK_SECRET=...
+```
+
+Ein Klartext-Passwort wird nicht angenommen. Ohne `--write` gibt der Befehl die beiden Zeilen nur aus.
+
+### 4. Zertifikats-Fingerprint holen
+
+```bash
+node dist/cli.js fingerprint
+```
+
+Liest die Adresse aus `environments.json`, zeigt Inhaber und Gültigkeit des Zertifikats und gibt die Zeile
+`"tlsFingerprint": "…"` aus. Diese unter `splunk` eintragen.
+
+### 5. Prüfen
+
+```bash
+node dist/cli.js check
+```
+
+Zeigt die gelesene Konfiguration, ohne eine Verbindung aufzubauen. In der Gemini CLI zeigt `/mcp` den Server `splunk`
+mit 18 Tools. Dann z. B.:
 
 > Welche Fehler gab es in der letzten Stunde auf INT1?
 
-Die Konfiguration lässt sich auch ohne Gemini prüfen (liest dieselben Umgebungsvariablen, baut keine Verbindung auf):
+### Rangfolge
 
-```bash
-SPLUNK_URL=… SPLUNK_HOST_TEST=… SPLUNK_BLOCKED_HOSTS=… SPLUNK_USERNAME=… SPLUNK_PASSWORD_ENC=… SPLUNK_SECRET=… node dist/cli.js check
-```
+`environments.json` gilt vor allem anderen. Was dort fehlt, kommt aus Umgebungsvariablen (`SPLUNK_*`, z. B. aus einem
+`env`-Block der `settings.json`), danach aus der `.env`. Andere Dateinamen: `SPLUNK_ENVIRONMENTS_FILE`, `SPLUNK_ENV_FILE`.
 
 ## Schutz der PROD-Daten
 
@@ -97,13 +165,8 @@ Der Schutz sitzt in diesem Server, nicht in Splunk. Details und Grenzen: Abschni
 
 ## Personenbezogene Daten pseudonymisieren (optional)
 
-Standardmäßig aus. Zum Einschalten `redaction.example.json` kopieren, anpassen und in der `settings.json` ergänzen:
-
-```json
-"SPLUNK_REDACTION_FILE": "/Users/dominik/.gemini/splunk-redaction.json"
-```
-
-Ist die Datei angegeben, aber nicht lesbar oder fehlerhaft, startet der Server nicht.
+Standardmäßig aus. Zum Einschalten `redaction.example.json` nach `redaction.json` in den Projektordner kopieren und anpassen.
+Liegt die Datei dort, ist die Pseudonymisierung an. Ist sie fehlerhaft, startet der Server nicht.
 
 ### Aufbau der Datei
 
@@ -138,6 +201,8 @@ Es muss mindestens `keys` oder `patterns` etwas enthalten. Die kleinste sinnvoll
 | logfmt | `lastName=Mustermann msg=done` | `lastName=[lastName#93931a8d] msg=done` |
 | Splunk-Feld | Feld `lastName` | ganzer Wert ersetzt |
 
+Bei `name=wert` ohne Anführungszeichen reicht der Wert bis zum nächsten Komma, zur schließenden Klammer, zum nächsten `name=` oder zum Zeilenende. So werden auch Werte mit Leerzeichen (`lastName=von der Heide`) vollständig ersetzt; steht danach nur noch Fließtext, wird dieser mit ersetzt. Die Hex-Werte in der Tabelle sind Beispiele.
+
 **`patterns` – nach Aussehen.** Erkennt Werte an ihrer Form, auch wenn kein Feldname davor steht.
 
 - `builtin` schaltet fertige Muster ein, die der Server mitbringt:
@@ -170,24 +235,26 @@ Gibt die Zeilen pseudonymisiert aus, ohne Gemini und ohne Splunk. Was danach noc
 
 ### PROD nur pseudonymisiert freigeben
 
-Statt PROD ganz zu sperren, kann der Host als Umgebung angelegt werden. Das geht nur zusammen mit der Pseudonymisierung, sonst startet der Server nicht:
+Statt PROD ganz zu sperren, kann der Host als Umgebung angelegt werden. Das geht nur, wenn `redaction.json` vorhanden ist,
+sonst startet der Server nicht. In `environments.json`:
 
 ```json
-"SPLUNK_PROTECTED_HOSTS": "prodhost01",
-"SPLUNK_HOST_PROD": "prodhost01",
-"SPLUNK_REDACTION_FILE": "/Users/dominik/.gemini/splunk-redaction.json"
+"environments": {
+  "PROD": { "description": "Produktion, nur pseudonymisiert", "hosts": ["prodhost01"] }
+},
+"protectedHosts": ["prodhost01"]
 ```
 
-`SPLUNK_BLOCKED_HOSTS` kann daneben weiter Hosts ganz sperren. Details und Grenzen: Abschnitt 4.5 in [tools.md](tools.md).
+`blockedHosts` kann daneben weiter Hosts ganz sperren. Details und Grenzen: Abschnitt 4.5 in [tools.md](tools.md).
 
 ## Ohne Zertifikatsprüfung oder ohne TLS
 
-- `SPLUNK_TLS_MODE=insecure` schaltet die Prüfung ab.
-- Eine `http://`-Adresse braucht `SPLUNK_ALLOW_HTTP=true`. Das Passwort geht dann beim Login unverschlüsselt übers Netz.
+- `"tlsMode": "insecure"` unter `splunk` schaltet die Prüfung ab.
+- Eine `http://`-Adresse braucht `"allowHttp": true`. Das Passwort geht dann beim Login unverschlüsselt übers Netz.
 
 ## Nach einem Passwortwechsel
 
-`node dist/cli.js encrypt` erneut ausführen, `SPLUNK_PASSWORD_ENC` (und `SPLUNK_SECRET`) ersetzen, Gemini CLI neu starten.
+`node dist/cli.js encrypt --write` erneut ausführen und Gemini CLI neu starten.
 Lehnt Splunk den Login einmal ab, versucht der Server es nicht erneut, bis er neu gestartet wird. Das schützt das AD-Konto vor einer Sperre.
 
 ## Entwicklung
@@ -200,7 +267,8 @@ SPLUNK_DEBUG=true # protokolliert jeden Splunk-Aufruf auf stderr
 | Datei | Inhalt |
 |---|---|
 | `src/cli.ts` | Einstieg: Server starten, `encrypt`, `fingerprint`, `check` |
-| `src/config.ts` | Umgebungsvariablen, Umgebungen, gesperrte Hosts |
+| `src/files.ts` | Liest `environments.json` und `.env` |
+| `src/config.ts` | Prüft die Konfiguration: Umgebungen, gesperrte Hosts |
 | `src/crypto.ts` | AES-256-GCM für das Passwort |
 | `src/client.ts` | HTTP, TLS-Pinning, Login/Session, Lockout-Schutz |
 | `src/spl.ts` | Regeln für Suchen, erzwungener Host-Filter, Ausschlussfilter |

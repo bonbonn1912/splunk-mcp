@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { fetchCertificate } from "./client.js";
+import { dotEnvPath, withConfigFiles } from "./files.js";
 import { loadConfig, log } from "./config.js";
 import { decryptPassword, encryptPassword, generateSecret } from "./crypto.js";
 import { SplunkMcpError } from "./errors.js";
@@ -11,7 +13,7 @@ const HELP = `splunk-mcp ${VERSION} – read-only MCP server for self-hosted Spl
 
 Usage:
   splunk-mcp                         Start the MCP server on stdio (used by Gemini CLI)
-  splunk-mcp encrypt [--secret <s>]  Encrypt the Splunk password for settings.json
+  splunk-mcp encrypt [--write]       Encrypt the Splunk password; --write stores it in .env
   splunk-mcp fingerprint [url]       Show the TLS certificate fingerprint of the Splunk server
   splunk-mcp redact <file.json>      Try a redaction file: reads log lines from stdin, prints them pseudonymised
   splunk-mcp check                   Validate the configuration from the environment variables
@@ -67,13 +69,27 @@ async function cmdEncrypt(args: string[]): Promise<void> {
   }
   const enc = encryptPassword(password, secret);
   if (decryptPassword(enc, secret) !== password) throw new Error("Selbsttest der Verschlüsselung fehlgeschlagen.");
-  process.stderr.write('\nIn ~/.gemini/settings.json unter mcpServers.splunk.env eintragen:\n\n');
-  process.stdout.write(`"SPLUNK_PASSWORD_ENC": "${enc}",\n"SPLUNK_SECRET": "${secret}",\n`);
+  if (args.includes("--write")) {
+    const file = dotEnvPath();
+    const kept = existsSync(file)
+      ? readFileSync(file, "utf8")
+          .split(/\r?\n/)
+          .filter((l) => !/^\s*(?:export\s+)?(SPLUNK_PASSWORD_ENC|SPLUNK_SECRET)\s*=/.test(l))
+      : ["# Zugangsdaten für splunk-mcp. Nicht einchecken."];
+    while (kept.length > 0 && kept[kept.length - 1]!.trim() === "") kept.pop();
+    kept.push(`SPLUNK_PASSWORD_ENC=${enc}`, `SPLUNK_SECRET=${secret}`, "");
+    writeFileSync(file, kept.join("\n"), { mode: 0o600 });
+    chmodSync(file, 0o600);
+    process.stderr.write(`\nGespeichert in ${file} (nur für dich lesbar).\n`);
+    return;
+  }
+  process.stderr.write("\nIn die Datei .env im Projektordner eintragen (oder mit --write direkt speichern):\n\n");
+  process.stdout.write(`SPLUNK_PASSWORD_ENC=${enc}\nSPLUNK_SECRET=${secret}\n`);
 }
 
 async function cmdFingerprint(args: string[]): Promise<void> {
-  const raw = args[0] ?? process.env.SPLUNK_URL;
-  if (!raw) throw new Error("Aufruf: splunk-mcp fingerprint https://host:8089");
+  const raw = args[0] ?? withConfigFiles(process.env).SPLUNK_URL;
+  if (!raw) throw new Error('Keine Adresse: "splunk.url" in environments.json eintragen oder so aufrufen: splunk-mcp fingerprint https://host:8089');
   const url = new URL(raw.includes("://") ? raw : `https://${raw}`);
   if (url.protocol !== "https:") throw new Error("Nur https://-Adressen haben ein Zertifikat.");
   const port = Number(url.port || 443);
@@ -83,9 +99,9 @@ async function cmdFingerprint(args: string[]): Promise<void> {
       `  Inhaber:    ${cert.subject}\n` +
       `  Aussteller: ${cert.issuer}\n` +
       `  Gültig:     ${cert.validFrom}  bis  ${cert.validTo}\n\n` +
-      `Bitte prüfen, ob das der erwartete Server ist. Dann in settings.json eintragen:\n\n`,
+      `Bitte prüfen, ob das der erwartete Server ist. Dann in environments.json unter "splunk" eintragen:\n\n`,
   );
-  process.stdout.write(`"SPLUNK_TLS_FINGERPRINT": "${cert.fingerprint256}",\n`);
+  process.stdout.write(`"tlsFingerprint": "${cert.fingerprint256}"\n`);
 }
 
 async function cmdRedact(args: string[]): Promise<void> {
@@ -108,7 +124,7 @@ function cmdCheck(): void {
     : c.tlsMode === "pinned"
       ? c.tlsFingerprint
         ? "pinned"
-        : "pinned, ABER SPLUNK_TLS_FINGERPRINT FEHLT"
+        : "pinned, ABER tlsFingerprint FEHLT"
       : c.tlsMode;
   process.stdout.write(`Konfiguration ist gültig.\n  Splunk:           ${c.url}  (tls=${tlsInfo})\n`);
   process.stdout.write(`  Gesperrte Hosts:  ${config.blockedHosts.join(", ") || "–"}\n`);

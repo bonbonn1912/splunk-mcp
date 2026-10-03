@@ -1,0 +1,21 @@
+{
+  "splunk": {
+    "url": "https://splunk.example.lan:8089",
+    "tlsFingerprint": "AB:CD:EF:…",
+    "user": "dein.benutzer"
+  },
+
+  "app": "meine_app",
+  "sourcetype": "mein:sourcetype",
+  "excludeActuator": true,
+
+  "environments": {
+    "TEST": { "description": "Testumgebung 1", "hosts": ["testhost01"] },
+    "TEST2": { "description": "Testumgebung 2", "hosts": ["testhost02"] },
+    "INT1": { "description": "Integration 1", "hosts": ["inthost01"] },
+    "INT2": { "description": "Integration 2", "hosts": ["inthost02"] },
+    "DEMO": { "description": "Demo-Umgebung", "hosts": ["demohost01"] }
+  },
+
+  "blockedHosts": ["prodhost01"]
+}

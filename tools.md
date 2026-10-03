@@ -4,7 +4,7 @@ MCP-Server in TypeScript für **selbst gehostetes Splunk Enterprise**, primär f
 Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, Rückgaben, Splunk-Endpunkte und Sicherheitsregeln.
 
 - Prosa: Deutsch. Tool-Namen, Parameter und `description`-Strings: Englisch (die liest das Modell).
-- Status: v1.2, implementiert in `src/`. Noch nicht gegen eine echte Splunk-Instanz erprobt.
+- Status: v1.3, implementiert in `src/`. Noch nicht gegen eine echte Splunk-Instanz erprobt.
 - Zielversion: Splunk Enterprise 10.2.x (v2-Search-Endpunkte, kein v1-Fallback).
 
 ---
@@ -24,7 +24,30 @@ Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, 
 | TLS | Self-signed Zertifikate per Fingerprint-Pinning (Standard), siehe 1.7. Unverschlüsseltes HTTP nur mit explizitem Flag |
 | Modus | **Ausschließlich read-only**. Es gibt keine schreibenden Tools |
 
-### 1.1 Konfiguration (Umgebungsvariablen)
+### 1.1 Konfiguration
+
+Die Konfiguration liegt in Dateien im Projektordner neben `dist/` (gleiches Schema wie beim `oracle-mcp`):
+
+| Datei | Inhalt |
+|---|---|
+| `environments.json` | Splunk-Adresse, Hosts der Umgebungen, gesperrte Hosts, Standardwerte |
+| `.env` | `SPLUNK_PASSWORD_ENC` und `SPLUNK_SECRET` |
+| `redaction.json` (optional) | Pseudonymisierung; ist die Datei vorhanden, ist sie an |
+
+Felder und Beispiele stehen in der [README](README.md). Jedes Feld der `environments.json` entspricht einer der
+Variablen unten; die Datei hat Vorrang, danach gelten Umgebungsvariablen, danach die `.env`. Unbekannte Einträge in
+der Datei sind ein Fehler.
+
+| `environments.json` | Variable |
+|---|---|
+| `splunk.url`, `.user`, `.tlsMode`, `.tlsFingerprint`, `.caCert`, `.allowHttp`, `.webPort`, `.webUrl`, `.locale` | `SPLUNK_URL`, `SPLUNK_USERNAME`, `SPLUNK_TLS_MODE`, `SPLUNK_TLS_FINGERPRINT`, `SPLUNK_CA_CERT`, `SPLUNK_ALLOW_HTTP`, `SPLUNK_WEB_PORT`, `SPLUNK_WEB_URL`, `SPLUNK_LOCALE` |
+| `environments.<NAME>.hosts`, `.description` | `SPLUNK_HOST_<NAME>`, `SPLUNK_DESCRIPTION_<NAME>` |
+| `blockedHosts`, `protectedHosts`, `redactionFile` | `SPLUNK_BLOCKED_HOSTS`, `SPLUNK_PROTECTED_HOSTS`, `SPLUNK_REDACTION_FILE` |
+| `app`, `sourcetype`, `index`, `excludeActuator`, `actuatorField`, `excludeTerms`, `allowedIndexes` (oben oder je Umgebung) | `SPLUNK_APP`, `SPLUNK_SOURCETYPE`, … (je Umgebung mit Suffix `_<NAME>`) |
+| `maxRows`, `maxOutputChars`, `searchTimeoutS`, `defaultEarliest`, `enableKvstore` | `SPLUNK_MAX_ROWS`, … |
+
+Die Variablen im Einzelnen:
+
 
 | Variable | Pflicht | Default | Bedeutung |
 |---|---|---|---|
@@ -73,27 +96,8 @@ Je Umgebung überschreibbar (Suffix `_<NAME>`): `SPLUNK_APP`, `SPLUNK_SOURCETYPE
   "mcpServers": {
     "splunk": {
       "command": "node",
-      "args": ["/pfad/zu/splunk-mcp/dist/cli.js"],
-      "env": {
-        "SPLUNK_URL": "https://splunk.example.lan:8089",
-        "SPLUNK_TLS_FINGERPRINT": "AB:CD:…",
-
-        "SPLUNK_USERNAME": "dein.benutzer",
-        "SPLUNK_PASSWORD_ENC": "v1:…:…:…",
-        "SPLUNK_SECRET": "…44 Zeichen Base64…",
-
-        "SPLUNK_APP": "meine_app",
-        "SPLUNK_SOURCETYPE": "mein:sourcetype",
-        "SPLUNK_EXCLUDE_ACTUATOR": "true",
-
-        "SPLUNK_HOST_TEST": "testhost01",
-        "SPLUNK_HOST_TEST2": "testhost02",
-        "SPLUNK_HOST_INT1": "inthost01",
-        "SPLUNK_HOST_INT2": "inthost02",
-        "SPLUNK_HOST_DEMO": "demohost01",
-
-        "SPLUNK_BLOCKED_HOSTS": "prodhost01"
-      },
+      "args": ["dist/cli.js"],
+      "cwd": "/path/to/splunk-mcp",
       "timeout": 180000,
       "trust": false
     }
@@ -101,10 +105,10 @@ Je Umgebung überschreibbar (Suffix `_<NAME>`): `SPLUNK_APP`, `SPLUNK_SOURCETYPE
 }
 ```
 
+- `cwd` ist der Projektordner. Ein `env`-Block ist nicht nötig; alles Weitere steht in `environments.json` und `.env`.
 - `timeout` muss über `SPLUNK_SEARCH_TIMEOUT_S` liegen.
 - Alle Tools tragen `readOnlyHint: true`.
-- Mit `includeTools` / `excludeTools` lässt sich die Tool-Menge pro Projekt einschränken.
-- Prüfen mit `/mcp` in der Gemini CLI.
+- Prüfen mit `/mcp` in der Gemini CLI oder mit `node dist/cli.js check`.
 
 ### 1.3 Regeln für Gemini-kompatible Schemas
 
@@ -137,7 +141,7 @@ Alle Tools liefern genau einen `text`-Content mit kompaktem JSON:
 
 ### 1.5 Passwort-Verschlüsselung
 
-Das Passwort steht nie im Klartext in der `settings.json`. Abgelegt werden zwei Werte:
+Das Passwort steht nie im Klartext in einer Datei. In der `.env` im Projektordner liegen zwei Werte:
 
 | Wert | Inhalt |
 |---|---|
@@ -146,15 +150,14 @@ Das Passwort steht nie im Klartext in der `settings.json`. Abgelegt werden zwei 
 
 - **Verfahren:** AES-256-GCM (`node:crypto`), 12-Byte-IV zufällig pro Verschlüsselung, 16-Byte-Auth-Tag. Das Secret ist direkt der Schlüssel; eine KDF ist bei echtem Zufall nicht nötig.
 - **Weitere Befehle:** `node dist/cli.js check` prüft die Konfiguration aus den Umgebungsvariablen, ohne eine Verbindung aufzubauen.
-- **Hilfsbefehl:** `node dist/cli.js encrypt` fragt das Passwort verdeckt ab (kein Echo, keine Shell-History), erzeugt ein neues Secret und gibt beide Zeilen fertig für die `settings.json` aus. Mit `--secret <wert>` wird ein vorhandenes Secret wiederverwendet.
+- **Hilfsbefehl:** `node dist/cli.js encrypt --write` fragt das Passwort verdeckt ab (kein Echo, keine Shell-History), erzeugt ein neues Secret und schreibt beide Zeilen in die `.env` (Dateirechte 600). Ohne `--write` werden die Zeilen nur ausgegeben.
 - **Start:** Der Server entschlüsselt im Speicher, meldet sich einmal über `POST /services/auth/login` an und nutzt danach nur noch den Session-Key (`Authorization: Splunk <key>`). Das Passwort geht so nur beim Login übers Netz, nicht bei jeder Anfrage. Läuft die Session ab (401), wird einmal neu angemeldet.
 - **Fehler:** Falsches Secret oder veränderter Wert ergibt `DECRYPT_FAILED`; ein fehlgeschlagener Login wird **nicht** wiederholt, damit das AD-Konto nicht gesperrt wird.
 - **Nach AD-Passwortwechsel:** `encrypt` erneut ausführen und `SPLUNK_PASSWORD_ENC` ersetzen.
 
 **Grenze dieses Schutzes:** Passwort und Schlüssel liegen in derselben Datei. Das verhindert Mitlesen am Bildschirm und zufälliges Auffinden per Textsuche, nicht aber das Entschlüsseln durch jemanden, der die Datei kopiert. Deshalb:
 
-- `chmod 600 ~/.gemini/settings.json`
-- Zugangsdaten nur in die Benutzer-Datei `~/.gemini/settings.json`, nie in eine `.gemini/settings.json` im Repo.
+- Die `.env` wird von `encrypt --write` mit Dateirechten 600 angelegt und steht in `.gitignore`.
 - Datei von Cloud-Sync und geteilten Backups ausnehmen.
 
 ### 1.6 Umgebungen
@@ -178,7 +181,7 @@ Splunk liefert den Management-Port 8089 standardmäßig mit TLS und einem selbst
 | `verify` | Normale Prüfung gegen System-CAs bzw. `SPLUNK_CA_CERT` | Zertifikat von interner CA |
 | `insecure` | Keine Prüfung | Nur als Notlösung; Warnung auf stderr |
 
-- **Fingerprint holen:** `node dist/cli.js fingerprint https://<host>:8089` verbindet sich einmal, zeigt Aussteller, Gültigkeit und Fingerprint und gibt die fertige Zeile für die `settings.json` aus.
+- **Fingerprint holen:** `node dist/cli.js fingerprint` liest die Adresse aus `environments.json`, verbindet sich einmal, zeigt Aussteller, Gültigkeit und Fingerprint und gibt die fertige Zeile für die `environments.json` aus.
 - **Zertifikat geändert:** Fehler `TLS_FINGERPRINT_MISMATCH`; es wird **kein** Login gesendet. Fingerprint neu holen und eintragen.
 - **Gar kein TLS (`http://`):** Nur mit `SPLUNK_ALLOW_HTTP=true`. Login und Session-Key gehen dann lesbar übers Netz.
 - Der Modus wirkt nur auf die Verbindungen dieses Servers (eigener `https.Agent`); `NODE_TLS_REJECT_UNAUTHORIZED` wird nicht angefasst.
@@ -268,7 +271,7 @@ Er ist in den Tabellen unten nicht jedes Mal wiederholt.
 
 > List the configured Splunk environments. Use this when the user has not said which environment to use, then ask them to choose.
 
-Keine Parameter. Rückgabe je Umgebung: `name`, `hosts`, `app`, `default_sourcetype`, `default_index`, `excluded`. Die gesperrten Hosts werden nicht genannt. Baut keine Verbindung auf.
+Keine Parameter. Rückgabe je Umgebung: `name`, `description`, `hosts`, `app`, `default_sourcetype`, `default_index`, `excluded`. Die gesperrten Hosts werden nicht genannt. Baut keine Verbindung auf.
 
 ### 3.1 Suche
 

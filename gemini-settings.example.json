@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "splunk": {
+      "command": "node",
+      "args": [
+        "dist/cli.js"
+      ],
+      "cwd": "/pfad/zu/splunk-mcp",
+      "timeout": 180000,
+      "trust": false
+    }
+  }
+}

@@ -31,7 +31,7 @@ export class LoginGate {
         "LOGIN_BLOCKED",
         "Splunk rejected the login. Further logins are blocked to avoid locking the account.",
         {
-          hint: "Do not retry. Tell the user to check the password (run `node dist/cli.js encrypt` again) and restart the MCP server.",
+          hint: "Do not retry. Tell the user to check the password (run `node dist/cli.js encrypt --write` again) and restart the MCP server.",
         },
       );
     }
@@ -122,7 +122,7 @@ class PinnedAgent extends https.Agent {
             "TLS_FINGERPRINT_MISMATCH",
             "The Splunk certificate does not match the pinned fingerprint. Nothing was sent.",
             {
-              hint: "Tell the user. If the certificate was replaced on purpose, run `node dist/cli.js fingerprint` and update SPLUNK_TLS_FINGERPRINT.",
+              hint: "Tell the user. If the certificate was replaced on purpose, run `node dist/cli.js fingerprint` and update tlsFingerprint in environments.json.",
             },
           ),
         );
@@ -140,7 +140,7 @@ function buildAgent(conn: ConnectionConfig): http.Agent | https.Agent {
     case "pinned": {
       if (!conn.tlsFingerprint) {
         throw new SplunkMcpError("TLS_FINGERPRINT_MISSING", "No certificate fingerprint configured.", {
-          hint: `Tell the user to run \`node dist/cli.js fingerprint ${conn.url}\` and add SPLUNK_TLS_FINGERPRINT to settings.json (or set SPLUNK_TLS_MODE=insecure).`,
+          hint: `Tell the user to run \`node dist/cli.js fingerprint\` and add "tlsFingerprint" under "splunk" in environments.json (or set "tlsMode": "insecure").`,
         });
       }
       return new PinnedAgent(conn.tlsFingerprint);
@@ -238,13 +238,13 @@ export class Connection {
       code === "ERR_TLS_CERT_ALTNAME_INVALID"
     ) {
       return new SplunkMcpError("TLS_ERROR", `The Splunk TLS certificate is not trusted (${code}).`, {
-        hint: "Set SPLUNK_TLS_MODE=pinned with SPLUNK_TLS_FINGERPRINT, or provide SPLUNK_CA_CERT.",
+        hint: "Set tlsMode pinned with tlsFingerprint in environments.json, or provide caCert.",
       });
     }
     return new SplunkMcpError(
       "UNREACHABLE",
       `Cannot reach Splunk at ${this.conn.url}${code ? ` (${code})` : ""}: ${e.message}`,
-      { hint: "Check SPLUNK_URL, the port and VPN/network access. Do not retry in a loop." },
+      { hint: "Check splunk.url in environments.json, the port and VPN/network access. Do not retry in a loop." },
     );
   }
 
@@ -270,7 +270,7 @@ export class Connection {
       this.gate.block();
       throw new SplunkMcpError("AUTH_FAILED", "Splunk rejected the login.", {
         splunkMessages: splunkMessages(res.body),
-        hint: "Do not retry. The password may be wrong, expired or the account locked. Tell the user to run `node dist/cli.js encrypt` again and restart the MCP server.",
+        hint: "Do not retry. The password may be wrong, expired or the account locked. Tell the user to run `node dist/cli.js encrypt --write` again and restart the MCP server.",
       });
     }
     throw new SplunkMcpError("SPLUNK_ERROR", `Login failed with HTTP ${res.status}.`, {

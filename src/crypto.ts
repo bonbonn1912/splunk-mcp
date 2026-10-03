@@ -11,7 +11,7 @@ function keyFromSecret(secret: string): Buffer {
   const key = Buffer.from(secret.trim(), "base64");
   if (key.length !== 32) {
     throw new SplunkMcpError("DECRYPT_FAILED", "SPLUNK_SECRET must be 32 random bytes encoded as Base64.", {
-      hint: "Run `node dist/cli.js encrypt` to create a matching secret and encrypted password.",
+      hint: "Run `node dist/cli.js encrypt --write` to create a matching secret and encrypted password in .env.",
     });
   }
   return key;
@@ -32,7 +32,7 @@ export function decryptPassword(encrypted: string, secret: string): string {
   const parts = encrypted.trim().split(":");
   const fail = () =>
     new SplunkMcpError("DECRYPT_FAILED", "SPLUNK_PASSWORD_ENC could not be decrypted with SPLUNK_SECRET.", {
-      hint: "Run `node dist/cli.js encrypt` again and replace both values in settings.json.",
+      hint: "Run `node dist/cli.js encrypt --write` again; it replaces both values in .env.",
     });
   if (parts.length !== 4 || parts[0] !== VERSION) throw fail();
   try {
