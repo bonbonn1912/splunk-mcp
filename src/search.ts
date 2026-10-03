@@ -1,7 +1,7 @@
 import type { Config } from "./config.js";
 import { enc, type SplunkClient } from "./client.js";
 import { SplunkMcpError } from "./errors.js";
-import { cleanRow, type Row } from "./format.js";
+import { applyRedaction, cleanRow, type Row } from "./format.js";
 import { isBlockedHost, mentionsBlockedHost } from "./spl.js";
 
 export interface JobStatus {
@@ -148,7 +148,11 @@ export async function jobResults(
   );
   const raw = res.results ?? [];
   // Filter on the full rows, before any field selection hides the host.
-  const { rows, blocked } = dropBlockedRows(raw, opts.blockedHosts);
+  const { rows: visibleRows, blocked } = dropBlockedRows(raw, opts.blockedHosts);
+  // Redact complete rows before field selection and before cleanRow can shorten
+  // _raw. Applying the redactor to the complete array preserves its cross-row
+  // learning pass, including values in fields the caller did not request.
+  const rows = applyRedaction(visibleRows);
   return {
     rows: rows.map((r) => cleanRow(r, opts.fields)),
     fetched: raw.length,

@@ -15,7 +15,7 @@ export const ALLOWED_COMMANDS = new Set([
   "bin", "bucket", "timewrap", "makecontinuous", "fillnull", "filldown", "replace", "convert", "fieldformat",
   "mvexpand", "mvcombine", "makemv", "nomv", "strcat", "rangemap", "addinfo",
   "transaction", "cluster", "addtotals", "addcoltotals", "accum", "delta", "autoregress", "trendline",
-  "untable", "xyseries", "transpose", "fieldsummary", "lookup", "iplocation",
+  "untable", "xyseries", "transpose", "fieldsummary", "iplocation",
   "abstract", "highlight", "outlier", "anomalydetection", "scrub", "tags", "typer",
 ]);
 
@@ -135,6 +135,12 @@ export function validateQuery(query: string, env: EnvironmentConfig, redactor?: 
   if (trimmed.includes("`")) {
     throw notAllowed("Macros and backticks are not allowed.", "Write the search without macros.");
   }
+  if (/\blookup\s*\(/i.test(trimmed.replace(/"(?:\\.|[^"\\])*"/g, '""'))) {
+    throw notAllowed(
+      "The lookup() function is not allowed because it can read data outside the selected environment.",
+      "Use fields from the scoped events only; lookup files and collections are not available to searches.",
+    );
+  }
   const s = scan(trimmed);
   if (s.unbalancedQuote) {
     throw notAllowed("The query has an unbalanced double quote.", "Close every quoted string.");
@@ -170,7 +176,77 @@ export function validateQuery(query: string, env: EnvironmentConfig, redactor?: 
 /** Commands that keep field names intact, so a pseudonymised field stays recognisable in the output. */
 const KEEPS_FIELD_NAMES = new Set(["search", "where", "stats", "eventstats", "streamstats", "top", "rare", "dedup", "table", "fields", "sort", "fillnull"]);
 /** Commands that move values to places where the field name is lost. Not usable while pseudonymisation is on. */
-const LOSES_FIELD_NAMES = new Set(["transpose", "untable", "xyseries", "fieldsummary", "contingency"]);
+const LOSES_FIELD_NAMES = new Set([
+  "transpose", "untable", "xyseries", "fieldsummary", "contingency", "timewrap", "tags", "addtotals", "addcoltotals",
+]);
+/** Commands where wildcard field operands can copy or transform protected values. */
+const WILDCARD_FIELD_COMMANDS = new Set([
+  "rename", "stats", "eventstats", "streamstats", "chart", "timechart", "top", "rare",
+  "convert", "fieldformat", "bin", "bucket", "replace", "fillnull", "filldown", "strcat",
+  "rex", "erex", "spath", "xpath", "extract", "kv", "xmlkv", "multikv",
+]);
+
+/** Removes balanced function calls while respecting quoted strings and nesting. */
+function removeFunctionCalls(text: string, functionName: string, visit?: (call: string) => void): string {
+  let out = "";
+  let inQuote = false;
+  let copiedFrom = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (inQuote) {
+      if (c === "\\") i++;
+      else if (c === '"') inQuote = false;
+      continue;
+    }
+    if (c === '"') {
+      inQuote = true;
+      continue;
+    }
+    if (text.slice(i, i + functionName.length).toLowerCase() !== functionName.toLowerCase()) continue;
+    const before = text[i - 1] ?? " ";
+    if (/[A-Za-z0-9_]/.test(before)) continue;
+    let open = i + functionName.length;
+    while (/\s/.test(text[open] ?? "")) open++;
+    if (text[open] !== "(") continue;
+    let depth = 1;
+    let quoted = false;
+    let end = open + 1;
+    for (; end < text.length && depth > 0; end++) {
+      const d = text[end]!;
+      if (quoted) {
+        if (d === "\\") end++;
+        else if (d === '"') quoted = false;
+      } else if (d === '"') quoted = true;
+      else if (d === "(") depth++;
+      else if (d === ")") depth--;
+    }
+    if (depth !== 0) continue;
+    visit?.(text.slice(i, end));
+    out += text.slice(copiedFrom, i);
+    copiedFrom = end;
+    i = end - 1;
+  }
+  return out + text.slice(copiedFrom);
+}
+
+function hasWildcardField(command: string, segment: string, unquoted: string): boolean {
+  if (command === "rename") return segment.includes("*"); // quoted field names are valid SPL too
+  if (["stats", "eventstats", "streamstats", "chart", "timechart", "top", "rare"].includes(command)) {
+    // count(*) counts events; other wildcard operands can select protected fields.
+    return removeFunctionCalls(segment, "eval").replace(/\bcount\s*\(\s*\*\s*\)/gi, "count() ").includes("*");
+  }
+  if (["convert", "fieldformat", "bin", "bucket", "replace", "fillnull", "filldown", "strcat", "addtotals", "addcoltotals"].includes(command)) {
+    // These commands operate on field selectors (and some support AS aliases).
+    // A wildcard operand can hide a protected source even when quoted.
+    return segment.includes("*");
+  }
+  if (["rex", "erex", "spath", "xpath", "extract", "kv", "xmlkv", "multikv"].includes(command)) {
+    // These commands name field selectors in options; a quoted wildcard there
+    // is still a selector, while wildcards inside a regex/path literal can be data.
+    if (/(?:^|\s)(?:field|output|path|fields)\s*=\s*(?:"[^"\r\n]*\*[^"\r\n]*"|'[^'\r\n]*\*[^'\r\n]*'|[A-Za-z_][\w.-]*\*[\w.*-]*)/i.test(segment)) return true;
+  }
+  return unquoted.includes("*");
+}
 
 /**
  * With pseudonymisation on, a blacklisted field must not be copied into a field
@@ -189,9 +265,28 @@ function checkPseudonymisedFields(query: string, s: Structure, redactor: Redacto
     const end = s.pipes[i + 1] ?? query.length;
     const segment = query.slice(start + 1, end);
     const keys = redactor.keysMentioned(segment);
-    if (keys.length === 0) return;
     const command = s.pipeCommands[i] ?? "";
     const unquoted = segment.replace(/"(?:\\.|[^"\\])*"/g, '""');
+    // Wildcards can select a protected field without spelling its name (for
+    // example `rename last* AS public*`). Fail closed in commands that can
+    // copy, extract, or aggregate field values.
+    if (redactor.keys.length > 0 && WILDCARD_FIELD_COMMANDS.has(command) && hasWildcardField(command, segment, unquoted)) {
+      throw notAllowed(
+        `Wildcard field patterns are not allowed in "${command}" while pseudonymisation is active.`,
+        "Name fields explicitly so protected values keep their configured field names and can be pseudonymised.",
+      );
+    }
+    if (keys.length === 0) return;
+    let protectedEval = false;
+    removeFunctionCalls(segment, "eval", (call) => {
+      if (redactor.keysMentioned(call).length > 0) protectedEval = true;
+    });
+    if (protectedEval) {
+      throw notAllowed(
+        `The pseudonymised field(s) ${keys.join(", ")} cannot be used inside eval() in "${command}".`,
+        "Keep protected fields under their original names; do not calculate or copy them into another result field.",
+      );
+    }
     if (!KEEPS_FIELD_NAMES.has(command) || /\bas\b/i.test(unquoted)) {
       throw notAllowed(
         `The pseudonymised field(s) ${keys.join(", ")} cannot be used in "${command}"${/\bas\b/i.test(unquoted) ? ' with "as"' : ""}.`,
@@ -204,6 +299,12 @@ function checkPseudonymisedFields(query: string, s: Structure, redactor: Redacto
 export function hostClause(hosts: string[]): string {
   if (hosts.length === 1) return `host=${quote(hosts[0]!)}`;
   return `host IN (${hosts.map(quote).join(", ")})`;
+}
+
+/** Mandatory positive index constraint for environments with an index allowlist. */
+export function allowedIndexClause(env: EnvironmentConfig): string | undefined {
+  if (env.allowedIndexes.length === 0) return undefined;
+  return `index IN (${env.allowedIndexes.map(quote).join(", ")})`;
 }
 
 export function blockedClause(blockedHosts: string[]): string {
@@ -251,6 +352,8 @@ export function applyScope(rawQuery: string, env: EnvironmentConfig, opts: Scope
   const rest = firstPipe === -1 ? "" : body.slice(firstPipe).trim();
 
   const prefix: string[] = [];
+  const allowedIndexes = allowedIndexClause(env);
+  if (allowedIndexes) prefix.push(allowedIndexes);
   const index = opts.index ?? env.defaultIndex;
   if (index && !mentions(base, "index")) prefix.push(`index=${quote(index)}`);
   const sourcetype = opts.sourcetype ?? env.defaultSourcetype;

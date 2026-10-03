@@ -70,7 +70,7 @@ Die Variablen im Einzelnen:
 | `SPLUNK_EXCLUDE_ACTUATOR` | nein | `false` | `true` blendet Spring-Boot-Actuator-Aufrufe (`/actuator…`) aus jeder Suche aus. Siehe 1.10 |
 | `SPLUNK_ACTUATOR_FIELD` | nein | – | Feld mit dem Request-Pfad (z. B. `uri`); ohne Angabe Filter auf den Rohtext |
 | `SPLUNK_EXCLUDE_TERMS` | nein | – | Weitere auszublendende Begriffe/Pfade, kommagetrennt |
-| `SPLUNK_ALLOWED_INDEXES` | nein | – | Kommagetrennte Allowlist; leer = alle laut Rolle |
+| `SPLUNK_ALLOWED_INDEXES` | nein | – | Kommagetrennte Allowlist, als fester Filter auf jede Suche angewendet; leer = alle laut Rolle |
 | `SPLUNK_ENABLE_KVSTORE` | nein | `false` | Schaltet `splunk_query_kvstore` frei. Standardmäßig aus, weil KV-Store-Inhalte keinem Host zugeordnet sind |
 | `SPLUNK_WEB_PORT` | nein | `8443` | Port von Splunk Web, für `meta.web_url`. Abweichende Adresse per `SPLUNK_WEB_URL` |
 | `SPLUNK_LOCALE` | nein | `de-DE` | Sprachpräfix im Splunk-Web-Pfad |
@@ -532,7 +532,7 @@ Daten der Hosts aus `SPLUNK_BLOCKED_HOSTS` dürfen nie in einer Antwort stehen. 
 | Kein führendes `\|` (keine generierenden Kommandos wie `tstats`, `metadata`, `inputlookup`, `loadjob`, `rest`) | Sie lesen Daten am Host-Filter vorbei |
 | Keine eckigen Klammern, also keine Subsearches (`append`, `join`, `union`, `foreach` …) | Eine Subsearch ist eine zweite Suche ohne Host-Filter |
 | Keine Backticks, also keine Macros | Ein Macro kann beliebige SPL enthalten |
-| Nach der ersten Pipe nur Kommandos einer festen Liste (`stats`, `eval`, `where`, `rex`, `timechart`, `top`, `table`, `sort`, `lookup` …; vollständig in `src/spl.ts`) | Erlaubt ist nur, was vorhandene Events umformt. Alles Unbekannte, auch App-eigene Kommandos, ist gesperrt |
+| Nach der ersten Pipe nur Kommandos einer festen Liste (`stats`, `eval`, `where`, `rex`, `timechart`, `top`, `table`, `sort` …; vollständig in `src/spl.ts`) | Erlaubt ist nur, was vorhandene Events umformt. `lookup` und alles Unbekannte, auch App-eigene Kommandos, sind gesperrt |
 | Anführungszeichen und Klammern müssen ausgeglichen sein | Sonst ließe sich die Klammer um die Suchbegriffe vorzeitig schließen |
 | Der Name eines gesperrten Hosts darf nirgends in der Suche vorkommen | Fehler `BLOCKED_HOST` |
 
@@ -548,7 +548,8 @@ Zusätzlich:
 - `splunk_list_sourcetypes` ist auf die Hosts der Umgebung begrenzt; eine Host-Liste über alle Hosts gibt es nicht.
 - `splunk_query_kvstore` ist standardmäßig aus.
 - Die Namen der gesperrten Hosts gibt der Server dem Modell nicht bekannt.
-- Bei gesetzter `SPLUNK_ALLOWED_INDEXES` werden Suchen abgelehnt, die andere Indizes nennen.
+- Bei gesetzter `SPLUNK_ALLOWED_INDEXES` wird jede Suche zusätzlich durch einen festen positiven Index-Filter begrenzt, einschließlich `splunk_list_sourcetypes`. Suchen, die andere Indizes nennen, werden abgelehnt. Negierte Index-Bedingungen können diesen Filter nicht entfernen.
+- Das Kommando `lookup` und die Funktion `lookup()` sind gesperrt: Sie könnten Daten außerhalb des Host-Filters an erlaubte Ereignisse anhängen.
 
 **Grenzen.** Der Schutz sitzt in diesem Server, nicht in Splunk. Er verhindert nicht, dass dieselben Zugangsdaten an anderer Stelle (Browser, `curl`) PROD-Daten lesen. Ebene 2 und 3 beruhen darauf, dass dieser Server SPL so zerlegt wie Splunk; Ebene 4 fängt Rohzeilen ab, aber keine aggregierten Werte. Eine echte Garantie gibt nur eine Splunk-Rolle mit Suchfilter (`srchFilter = NOT host=<prod>`), die ein Splunk-Admin einrichten müsste.
 
@@ -607,7 +608,9 @@ Optional. Aktiv, sobald `SPLUNK_REDACTION_FILE` auf eine Datei zeigt; ohne die V
 
 - **Pseudonym:** `[<Name>#<8 Hex-Zeichen>]`, berechnet als HMAC-SHA256 des Wertes. Derselbe Wert ergibt immer dasselbe Pseudonym, unabhängig vom Format. Zählen und Zuordnen bleibt also möglich.
 - **Bekannte Werte:** Ein einmal pseudonymisierter Wert (ab 4 Zeichen) wird in der laufenden Sitzung auch dort ersetzt, wo er ohne Namen auftaucht, z. B. `Kunde Mustermann nicht gefunden`.
-- **Geltung:** Für alle Umgebungen und alle Tools; jede Antwort läuft durch denselben Filter.
+- **Geltung:** Für alle Umgebungen und alle Tools; Ergebnisdaten, Metadaten, Hinweise und Fehler werden bereinigt. Suchergebnisse werden vollständig pseudonymisiert, bevor Felder ausgewählt oder lange Rohtexte gekürzt werden.
+- **Splunk-Weblinks:** Bei aktiver Pseudonymisierung entfällt `meta.web_url`, damit die im Link kodierte Suche keine personenbezogenen Werte ausgibt.
+- **Steuerdaten:** Vom Server erzeugte Job-IDs, Umgebungsnamen und Angaben zur Seitennavigation werden erhalten. Gleichnamige Felder in Ergebniszeilen werden weiterhin pseudonymisiert.
 - **Ausprobieren:** `node dist/cli.js redact redaction.json < beispiel.log` gibt die Zeilen pseudonymisiert aus.
 
 **Zusätzliche Regeln für Suchen bei aktiver Pseudonymisierung:**
@@ -619,6 +622,9 @@ Optional. Aktiv, sobald `SPLUNK_REDACTION_FILE` auf eine Datei zeigt; ohne die V
 | | Kommandos, bei denen der Feldname verloren geht: `chart`/`timechart … by lastName`, `transpose`, `untable`, `xyseries`, `fieldsummary`, `contingency` |
 
 Grund: Unter einem anderen Feldnamen würde der Filter den Wert nicht mehr erkennen.
+Die Prüfung erfasst auch Wildcards in Feldnamen, etwa `rename last* as public*`.
+Bei aktiver Pseudonymisierung sind außerdem `addtotals`, `addcoltotals`, `timewrap` und `tags` gesperrt:
+Sie können implizit Werte aus allen Feldern kopieren oder Werte unter anderen Feldnamen ausgeben. Arithmetik mit `*` in `eval` bleibt möglich.
 
 **Grenzen.** Es ist eine Sperrliste: Was keinem Namen und keinem Muster entspricht, bleibt lesbar, etwa ein Name in einem Freitextfeld oder ein Feld, das in `keys` fehlt. Aus einem Feld, das die ganze Nachricht enthält, kann eine Suche mit Zeichenketten-Funktionen Teile herausschneiden, die der Filter nicht zuordnen kann. Über gezieltes Filtern (`lastName=M*`) lässt sich auf Werte schließen. Kurze, häufige Werte wie Vornamen sind bei bekanntem `salt` erratbar. Die Liste sollte deshalb mit `redact` an echten Log-Zeilen geprüft werden, bevor PROD freigegeben wird.
 
