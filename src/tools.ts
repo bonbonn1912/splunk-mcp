@@ -6,7 +6,7 @@ import { type Config, log } from "./config.js";
 import { SplunkMcpError } from "./errors.js";
 import { contains, fail, isoTime, ok, type Row } from "./format.js";
 import { assertOwnJob, clampRows, createJob, dropBlockedRows, jobResults, jobStatus, runSearch, webUrl } from "./search.js";
-import { applyScope, blockedClause, exclusionClauses, hostClause, quote, validateQuery } from "./spl.js";
+import { allowedIndexClause, applyScope, blockedClause, exclusionClauses, hostClause, quote, validateQuery } from "./spl.js";
 
 interface Entry {
   name: string;
@@ -150,7 +150,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
 
   tool(
     "splunk_search",
-    "Run an SPL event search and wait for the results. Use this for most questions about log data. The host filter of the environment, the default sourcetype and the exclusion filters are added automatically and cannot be removed; meta.effective_query shows what actually ran. Write only search terms followed by pipes (stats, eval, where, rex, timechart, ...). Not allowed: a leading pipe, subsearches in [ ], macros, and commands that read other data (append, join, tstats, inputlookup, ...). Always set a time range and keep max_rows small; prefer aggregating over fetching raw events. For searches expected to run longer than about two minutes use splunk_start_search.",
+    "Run an SPL event search and wait for the results. Use this for most questions about log data. The host filter of the environment, allowed index list, default sourcetype and exclusion filters are added automatically and cannot be removed; meta.effective_query shows what actually ran. Write only search terms followed by pipes (stats, eval, where, rex, timechart, ...). Not allowed: a leading pipe, subsearches in [ ], macros, and commands that read other data (append, join, lookup, tstats, inputlookup, ...). Always set a time range and keep max_rows small; prefer aggregating over fetching raw events. For searches expected to run longer than about two minutes use splunk_start_search.",
     {
       query: z
         .string()
@@ -234,6 +234,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       return ok(
         {
           data: { sid },
+          controlDataKeys: ["sid"],
           meta: {
             environment: client.env.name,
             earliest,
@@ -259,6 +260,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       return ok(
         {
           data: status,
+          controlDataKeys: ["sid"],
           meta: { environment: client.env.name },
           hint: status.is_failed
             ? "The job failed. Read messages and fix the query."
@@ -332,7 +334,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
     async ({ sid }, { client }) => {
       assertOwnJob(sid, client.env.name);
       await client.post(`/services/search/v2/jobs/${enc(sid)}/control`, { action: "cancel" });
-      return ok({ data: { sid, cancelled: true }, meta: { environment: client.env.name } }, config.maxOutputChars);
+      return ok({ data: { sid, cancelled: true }, controlDataKeys: ["sid"], meta: { environment: client.env.name } }, config.maxOutputChars);
     },
   );
 
@@ -444,7 +446,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       }
       const limit = clampRows(args.max_rows, 100, config);
       // Built by the server, not by the model: an indexed-field query limited to the environment's hosts.
-      const where = [index ? `index=${quote(index)}` : undefined, hostClause(client.env.hosts), client.env.blockedHosts.length > 0 ? blockedClause(client.env.blockedHosts) : undefined]
+      const where = [allowedIndexClause(client.env), index ? `index=${quote(index)}` : undefined, hostClause(client.env.hosts), client.env.blockedHosts.length > 0 ? blockedClause(client.env.blockedHosts) : undefined]
         .filter(Boolean)
         .join(" ");
       const query = `| tstats count as totalCount min(_time) as firstTime max(_time) as lastTime where ${where} by ${field} | sort - totalCount | head ${limit}`;
@@ -988,7 +990,7 @@ Rules:
 - Every tool needs "environment". If the user did not name one, call splunk_list_environments and ask. Never guess, never switch environment on your own.
 - Every search is automatically limited to the hosts of the chosen environment. This cannot be changed. Do not add host filters yourself.
 - Some hosts are blocked because their data is confidential. If you get BLOCKED_HOST or QUERY_NOT_ALLOWED, do not look for another way to reach that data; tell the user.
-- Write plain event searches: search terms, then pipes (stats, eval, where, rex, timechart, top, ...). No leading pipe, no subsearches in [ ], no macros, no append/join/tstats/inputlookup.
+- Write plain event searches: search terms, then pipes (stats, eval, where, rex, timechart, top, ...). No leading pipe, no subsearches in [ ], no macros, no append/join/lookup/tstats/inputlookup.
 - Values like [lastName#3fa9c2d1] are pseudonyms for personal data: the same value always gives the same pseudonym, so you can count and correlate them, but the real value is not available. Do not try to recover it. Pseudonymised fields can be filtered and grouped (stats ... by), not copied, renamed or extracted.
 - meta.effective_query shows the SPL that actually ran, including the default sourcetype and exclusion filters.
 - Explore before guessing: splunk_list_sourcetypes shows which logs exist, splunk_get_field_summary shows the available fields.

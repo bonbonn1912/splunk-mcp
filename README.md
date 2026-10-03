@@ -161,6 +161,9 @@ mit 18 Tools. Dann z. B.:
 3. Aus jedem Ergebnis werden Zeilen entfernt, die von einem gesperrten Host stammen oder ihn erwähnen.
 4. Es lassen sich nur Suchjobs lesen, die der Server selbst gestartet hat.
 
+`allowedIndexes` wird als zusätzlicher fester Index-Filter auf jede Suche angewendet, auch auf die Übersicht der
+Sourcetypes. Das Kommando `lookup` und die Funktion `lookup()` sind gesperrt, weil sie Daten außerhalb der gewählten Hosts hinzufügen können.
+
 Der Schutz sitzt in diesem Server, nicht in Splunk. Details und Grenzen: Abschnitt 4.1 in [tools.md](tools.md).
 
 ## Personenbezogene Daten pseudonymisieren (optional)
@@ -224,6 +227,11 @@ Bei `name=wert` ohne Anführungszeichen reicht der Wert bis zum nächsten Komma,
 - Derselbe Wert ergibt immer dasselbe Pseudonym, egal in welchem Format er steht. Zählen und Zuordnen bleibt also möglich.
 - Ein einmal erkannter Wert (ab 4 Zeichen) wird in der laufenden Sitzung auch dort ersetzt, wo er ohne Namen auftaucht, z. B. in `Kunde Mustermann nicht gefunden`.
 - Bei aktiver Pseudonymisierung darf nach gesperrten Feldern gefiltert und gruppiert werden (`stats count by lastName`), aber sie dürfen nicht kopiert, umbenannt oder extrahiert werden (`eval x=lastName`, `rex`).
+- Wildcards dürfen diese Regeln nicht umgehen, etwa durch `rename last* as public*`.
+- `addtotals`, `addcoltotals`, `timewrap` und `tags` sind bei aktiver Pseudonymisierung gesperrt, weil sie Werte implizit kopieren oder ihre Feldnamen verändern können.
+- Ergebnisse werden vor Feld-Auswahl und Kürzung pseudonymisiert. Metadaten, Hinweise und Fehlermeldungen werden ebenfalls bereinigt.
+- Bei aktiver Pseudonymisierung wird `meta.web_url` weggelassen, weil der Link die vollständige Suche enthält.
+- Vom Server erzeugte Job-IDs, Umgebungsnamen und Angaben zur Seitennavigation bleiben verwendbar.
 
 ### Ausprobieren
 
@@ -261,6 +269,7 @@ Lehnt Splunk den Login einmal ab, versucht der Server es nicht erneut, bis er ne
 
 ```bash
 npm run typecheck
+npm test
 SPLUNK_DEBUG=true # protokolliert jeden Splunk-Aufruf auf stderr
 ```
 

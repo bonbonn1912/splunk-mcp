@@ -6,7 +6,7 @@ export type Row = Record<string, unknown>;
 
 const RAW_LIMIT = 2000;
 
-/** Removes Splunk-internal fields and shortens _raw. */
+/** Removes Splunk-internal fields and shortens _raw after any redaction. */
 export function cleanRow(row: Row, fields?: string[]): Row {
   const out: Row = {};
   const wanted = fields && fields.length > 0 ? new Set(fields) : undefined;
@@ -29,6 +29,8 @@ export interface Payload {
   data: unknown;
   meta?: Record<string, unknown>;
   hint?: string;
+  /** Only server-generated job identifiers may bypass content redaction. */
+  controlDataKeys?: readonly "sid"[];
 }
 
 /**
@@ -43,10 +45,52 @@ export function setRedactor(r: Redactor | undefined): void {
   redactor = r;
 }
 
+/** Apply the configured redactor to a complete value (including its two-pass scan). */
+export function applyRedaction<T>(value: T): T {
+  return redactor ? redactor.apply(value) : value;
+}
+
+const CONTROL_META_KEYS = ["sid", "environment", "offset", "next_offset", "count", "total"] as const;
+
+/** Redact content together, while preserving the server's paging/job controls. */
+function sanitizePayload(payload: Payload): Payload {
+  if (!redactor) return payload;
+  const meta = { ...(payload.meta ?? {}) };
+  const controlMeta: Record<string, unknown> = {};
+  for (const key of CONTROL_META_KEYS) {
+    if (!Object.hasOwn(meta, key)) continue;
+    controlMeta[key] = meta[key];
+    delete meta[key];
+  }
+  // Only the server's metadata link embeds the complete search. A data row's
+  // own web_url field remains ordinary content and is still redacted.
+  delete meta.web_url;
+  let data = payload.data;
+  const controlData: Record<string, unknown> = {};
+  if (payload.controlDataKeys && data && typeof data === "object" && !Array.isArray(data)) {
+    const obj = { ...(data as Record<string, unknown>) };
+    for (const key of payload.controlDataKeys) {
+      if (!Object.hasOwn(obj, key)) continue;
+      controlData[key] = obj[key];
+      delete obj[key];
+    }
+    data = obj;
+  }
+  // The tuple keeps envelope names out of the key blacklist and still learns
+  // sensitive values across data, metadata and hints in the same two passes.
+  const [safeData, safeMeta, safeHint] = redactor.apply([data, meta, payload.hint] as const);
+  return {
+    data: Object.keys(controlData).length > 0 ? { ...(safeData as Record<string, unknown>), ...controlData } : safeData,
+    meta: { ...safeMeta, ...controlMeta },
+    hint: safeHint,
+  };
+}
+
 export function ok(payload: Payload, maxChars: number, truncationHint?: string): CallToolResult {
-  let data = redactor ? redactor.apply(payload.data) : payload.data;
-  const meta: Record<string, unknown> = { ...(payload.meta ?? {}) };
-  let hint = payload.hint;
+  const sanitized = sanitizePayload(payload);
+  let data = sanitized.data;
+  const meta: Record<string, unknown> = { ...(sanitized.meta ?? {}) };
+  let hint = typeof sanitized.hint === "string" ? sanitized.hint : undefined;
 
   const render = () => JSON.stringify({ ok: true, data, meta, ...(hint ? { hint } : {}) });
 
@@ -56,7 +100,7 @@ export function ok(payload: Payload, maxChars: number, truncationHint?: string):
     const original = rows.length;
     // The truncation notes are part of the output, so set them before measuring.
     meta.truncated = true;
-    hint = truncationHint ?? "Output was cut to fit the size limit. Narrow the request or page with offset.";
+    hint = applyRedaction(truncationHint ?? "Output was cut to fit the size limit. Narrow the request or page with offset.");
     const take = (n: number) => {
       data = rows.slice(0, n);
       meta.count = n;
@@ -87,7 +131,7 @@ export function ok(payload: Payload, maxChars: number, truncationHint?: string):
       obj[k] = `${v.slice(0, keep)}… [cut, ${v.length - keep} more chars]`;
       data = obj;
       meta.truncated = true;
-      hint = truncationHint ?? "A long value was cut to fit the size limit.";
+      hint = applyRedaction(truncationHint ?? "A long value was cut to fit the size limit.");
       text = render();
     }
   }
@@ -111,7 +155,20 @@ export function fail(err: unknown): CallToolResult {
     const message = err instanceof Error ? err.message : String(err);
     body = { ok: false, error: { code: "INTERNAL", message } };
   }
-  return { content: [{ type: "text", text: JSON.stringify(body) }], isError: true };
+  const error = body.error as Record<string, unknown>;
+  const { code, ...errorContent } = error;
+  const sanitized = sanitizePayload({
+    data: errorContent,
+    meta: body.meta as Record<string, unknown> | undefined,
+    hint: body.hint as string | undefined,
+  });
+  const safeBody = {
+    ok: false,
+    error: { code, ...(sanitized.data as Record<string, unknown>) },
+    ...(body.meta ? { meta: sanitized.meta } : {}),
+    ...(sanitized.hint ? { hint: sanitized.hint } : {}),
+  };
+  return { content: [{ type: "text", text: JSON.stringify(safeBody) }], isError: true };
 }
 
 /** Splunk epoch seconds (number or string) to ISO 8601; passes other values through. */
