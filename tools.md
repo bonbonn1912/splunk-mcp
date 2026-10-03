@@ -4,7 +4,7 @@ MCP-Server in TypeScript für **selbst gehostetes Splunk Enterprise**, primär f
 Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, Rückgaben, Splunk-Endpunkte und Sicherheitsregeln.
 
 - Prosa: Deutsch. Tool-Namen, Parameter und `description`-Strings: Englisch (die liest das Modell).
-- Status: v1.1, implementiert in `src/`. Noch nicht gegen eine echte Splunk-Instanz erprobt.
+- Status: v1.2, implementiert in `src/`. Noch nicht gegen eine echte Splunk-Instanz erprobt.
 - Zielversion: Splunk Enterprise 10.2.x (v2-Search-Endpunkte, kein v1-Fallback).
 
 ---
@@ -18,7 +18,8 @@ Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, 
 | Transport | **stdio** (Standard für Gemini CLI). Streamable HTTP optional später |
 | Splunk-Zugriff | **Eine** Splunk-Instanz, REST-API über den Management-Port `8089`. Splunk Web `8443` nur für Links. Immer `output_mode=json` |
 | Umgebungen | TEST, TEST2, INT1 … sind **Host-Filter** auf dieser einen Instanz, siehe 1.6 |
-| Gesperrte Hosts | Der PROD-Host darf nie in Ergebnissen auftauchen. Mehrstufiger Schutz, siehe 4.1 |
+| Gesperrte Hosts | Der PROD-Host ist entweder ganz gesperrt oder nur pseudonymisiert nutzbar, siehe 4.1 und 4.5 |
+| Pseudonymisierung | Optional über eine eigene Datei, Standard aus, siehe 4.5 |
 | Authentifizierung | Benutzer + verschlüsselt abgelegtes Passwort (siehe 1.5); einmaliger Login, danach Session-Key. Bearer-Token optional |
 | TLS | Self-signed Zertifikate per Fingerprint-Pinning (Standard), siehe 1.7. Unverschlüsseltes HTTP nur mit explizitem Flag |
 | Modus | **Ausschließlich read-only**. Es gibt keine schreibenden Tools |
@@ -29,7 +30,9 @@ Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, 
 |---|---|---|---|
 | `SPLUNK_URL` | ja | – | Management-Port der Splunk-Instanz, z. B. `https://splunk.example.lan:8089` |
 | `SPLUNK_HOST_<NAME>` | ja (mind. eine) | – | Legt die Umgebung `<NAME>` an und nennt ihre Hosts, z. B. `SPLUNK_HOST_INT1=inthost01`. Kommaliste und Wildcard (`int-*`) möglich |
-| `SPLUNK_BLOCKED_HOSTS` | **ja** | – | Hosts, deren Daten nie ausgegeben werden dürfen (PROD). Kommaliste, Wildcard möglich. Ohne diese Angabe startet der Server nicht |
+| `SPLUNK_BLOCKED_HOSTS` | ja** | – | Hosts, deren Daten nie ausgegeben werden dürfen. Kommaliste, Wildcard möglich |
+| `SPLUNK_PROTECTED_HOSTS` | ja** | – | Hosts, die nur mit aktiver Pseudonymisierung durchsucht werden dürfen (z. B. PROD). Ohne `SPLUNK_REDACTION_FILE` wirken sie wie gesperrt |
+| `SPLUNK_REDACTION_FILE` | nein | – | Pfad zur Pseudonymisierungs-Datei (4.5). Nicht gesetzt = aus |
 | `SPLUNK_USERNAME` | ja* | – | Splunk- bzw. AD-Benutzername |
 | `SPLUNK_PASSWORD_ENC` | ja* | – | Verschlüsseltes Passwort, Format siehe 1.5 |
 | `SPLUNK_SECRET` | ja* | – | Zufälliger 32-Byte-Schlüssel (Base64) zum Entschlüsseln |
@@ -54,6 +57,8 @@ Dieses Dokument ist die verbindliche Spezifikation der Tools: Namen, Parameter, 
 | `SPLUNK_SEARCH_TIMEOUT_S` | nein | `120` | Max. Wartezeit für `splunk_search` |
 | `SPLUNK_REQUEST_TIMEOUT_MS` | nein | `60000` | Zeitlimit je HTTP-Anfrage an Splunk |
 | `SPLUNK_DEBUG` | nein | `false` | Protokolliert jeden Splunk-Aufruf auf stderr |
+
+\*\* Mindestens eine der beiden muss gesetzt sein, sonst startet der Server nicht.
 
 \* Entfällt, wenn `SPLUNK_TOKEN` gesetzt ist. Ein Klartext-`SPLUNK_PASSWORD` wird bewusst **nicht** unterstützt.
 
@@ -161,7 +166,7 @@ Es gibt **eine** Splunk-Instanz. Eine Umgebung ist nichts anderes als ein fester
 - **Wirkung:** Jede Suche bekommt zwingend `host=<Hosts der Umgebung>` vorangestellt. Das lässt sich pro Aufruf **nicht** überschreiben oder abschalten.
 - **Gemeinsam für alle Umgebungen:** URL, Zertifikat, Zugangsdaten, Sourcetype. Es gibt nur eine Anmeldung und eine Session.
 - **Job-IDs:** Eine `sid` gilt nur in der Umgebung und Sitzung, die sie erzeugt hat. Jede Antwort trägt `meta.environment`.
-- **PROD:** Wird nicht als Umgebung angelegt. Der PROD-Host steht in `SPLUNK_BLOCKED_HOSTS`. Überschneidet sich ein Umgebungs-Host mit einem gesperrten Host, startet der Server nicht.
+- **PROD:** Zwei Möglichkeiten. Entweder steht der PROD-Host in `SPLUNK_BLOCKED_HOSTS` und ist gar nicht erreichbar. Oder er steht in `SPLUNK_PROTECTED_HOSTS` und wird als Umgebung angelegt (`SPLUNK_HOST_PROD=…`); das geht nur zusammen mit `SPLUNK_REDACTION_FILE`, sonst startet der Server nicht. In allen anderen Umgebungen bleibt der PROD-Host gesperrt.
 
 ### 1.7 TLS bei self-signed oder fehlendem Zertifikat
 
@@ -515,7 +520,7 @@ Nur registriert mit `SPLUNK_ENABLE_KVSTORE=true`. KV-Store-Inhalte lassen sich k
 
 Daten der Hosts aus `SPLUNK_BLOCKED_HOSTS` dürfen nie in einer Antwort stehen. Dafür greifen vier Ebenen nacheinander:
 
-**1. Konfiguration.** Ohne `SPLUNK_BLOCKED_HOSTS` startet der Server nicht. Er startet auch nicht, wenn sich ein Umgebungs-Host mit einem gesperrten Host überschneidet (auch per Wildcard).
+**1. Konfiguration.** Ohne `SPLUNK_BLOCKED_HOSTS` oder `SPLUNK_PROTECTED_HOSTS` startet der Server nicht. Er startet auch nicht, wenn sich ein Umgebungs-Host mit einem gesperrten Host überschneidet (auch per Wildcard), oder wenn eine Umgebung einen geschützten Host enthält und keine Pseudonymisierung konfiguriert ist. Geschützte Hosts gelten in jeder Umgebung, zu der sie nicht gehören, als gesperrt.
 
 **2. Regeln für die Suche.** Vor dem Absenden wird jede Suche geprüft, auch die SPL gespeicherter Suchen:
 
@@ -559,6 +564,60 @@ Der Server arbeitet mit dem persönlichen AD-Konto des Benutzers; einen Service-
 - Passwort, Secret, Session-Key und Token erscheinen weder in Tool-Antworten noch in Logs oder Fehlermeldungen.
 - Logs gehen ausschließlich nach **stderr** (stdout gehört dem MCP-Protokoll).
 - Jeder Tool-Aufruf wird mit Tool-Name, Dauer, `sid` und Zeilenzahl protokolliert, die SPL nur auf Debug-Level.
+
+### 4.5 Pseudonymisierung personenbezogener Daten
+
+Optional. Aktiv, sobald `SPLUNK_REDACTION_FILE` auf eine Datei zeigt; ohne die Variable ist sie aus. Ist die Datei angegeben, aber nicht lesbar oder fehlerhaft, startet der Server nicht.
+
+**Datei** (Vorlage: `redaction.example.json`):
+
+```json
+{
+  "keys": ["firstName", "lastName", "birthDate", "iban", "email", "street"],
+  "patterns": {
+    "builtin": ["email", "iban", "phone"],
+    "custom": [{ "name": "kundennummer", "regex": "KD-\\d{8}" }]
+  },
+  "salt": "optional"
+}
+```
+
+| Eintrag | Bedeutung |
+|---|---|
+| `keys` | Sperrliste von Namen, Groß-/Kleinschreibung egal |
+| `patterns.builtin` | Eingebaute Muster: `email`, `iban`, `phone` (nur internationales Format mit `+`), `creditcard` (mit Prüfziffer), `ipv4` |
+| `patterns.custom` | Eigene reguläre Ausdrücke mit Namen |
+| `salt` | Fester Text: Pseudonyme bleiben über Neustarts gleich. Ohne Angabe wird bei jedem Start neu gewürfelt |
+
+**Wo ein Name aus `keys` greift:**
+
+| Form | Beispiel | Ergebnis |
+|---|---|---|
+| JSON | `"lastName":"Mustermann"` | `"lastName":"[lastName#93931a8d]"` |
+| JSON in einem String | `\"lastName\":\"Mustermann\"` | `\"lastName\":\"[lastName#93931a8d]\"` |
+| JSON-Objekt/-Liste als Wert | `"address":{…}` | `"address":"[address#…]"` |
+| XML-Element, auch mit Namespace | `<ns2:lastName>Mustermann</ns2:lastName>` | `<ns2:lastName>[lastName#93931a8d]</ns2:lastName>` |
+| XML-Attribut | `customerId="4711"` | `customerId="[customerId#…]"` |
+| `toString()` (Lombok, IntelliJ, Commons) | `Person(firstName=Max, lastName=von der Heide)` | `Person(firstName=[firstName#…], lastName=[lastName#…])` |
+| logfmt / Query-String | `lastName=Mustermann msg=done` | `lastName=[lastName#93931a8d] msg=done` |
+| Splunk-Feld | `lastName`, `person.lastName{}`, `values(lastName)` | ganzer Wert ersetzt |
+
+- **Pseudonym:** `[<Name>#<8 Hex-Zeichen>]`, berechnet als HMAC-SHA256 des Wertes. Derselbe Wert ergibt immer dasselbe Pseudonym, unabhängig vom Format. Zählen und Zuordnen bleibt also möglich.
+- **Bekannte Werte:** Ein einmal pseudonymisierter Wert (ab 4 Zeichen) wird in der laufenden Sitzung auch dort ersetzt, wo er ohne Namen auftaucht, z. B. `Kunde Mustermann nicht gefunden`.
+- **Geltung:** Für alle Umgebungen und alle Tools; jede Antwort läuft durch denselben Filter.
+- **Ausprobieren:** `node dist/cli.js redact redaction.json < beispiel.log` gibt die Zeilen pseudonymisiert aus.
+
+**Zusätzliche Regeln für Suchen bei aktiver Pseudonymisierung:**
+
+| Erlaubt | Abgelehnt (`QUERY_NOT_ALLOWED`) |
+|---|---|
+| Filtern: `lastName=Mustermann`, `where lastName="…"` | Kopieren: `eval x=lastName`, `rename lastName as x`, `stats values(lastName) as x` |
+| Gruppieren und Auflisten unter eigenem Namen: `stats count by lastName`, `top`, `dedup`, `table`, `sort` | Extrahieren: `rex`, `spath` mit dem Namen |
+| | Kommandos, bei denen der Feldname verloren geht: `chart`/`timechart … by lastName`, `transpose`, `untable`, `xyseries`, `fieldsummary`, `contingency` |
+
+Grund: Unter einem anderen Feldnamen würde der Filter den Wert nicht mehr erkennen.
+
+**Grenzen.** Es ist eine Sperrliste: Was keinem Namen und keinem Muster entspricht, bleibt lesbar, etwa ein Name in einem Freitextfeld oder ein Feld, das in `keys` fehlt. Aus einem Feld, das die ganze Nachricht enthält, kann eine Suche mit Zeichenketten-Funktionen Teile herausschneiden, die der Filter nicht zuordnen kann. Über gezieltes Filtern (`lastName=M*`) lässt sich auf Werte schließen. Kurze, häufige Werte wie Vornamen sind bei bekanntem `salt` erratbar. Die Liste sollte deshalb mit `redact` an echten Log-Zeilen geprüft werden, bevor PROD freigegeben wird.
 
 ---
 
@@ -619,5 +678,6 @@ Das Wissen bleibt nicht zwischen Sitzungen erhalten. Feste Hinweise (wichtige Fe
 
 - [ ] Erster Lauf gegen die echte Instanz (10.2.7): Login, eine einfache Suche, `splunk_list_sourcetypes`.
 - [ ] Hostnamen der Umgebungen und des PROD-Hosts eintragen; prüfen, ob PROD mehrere Hosts hat.
+- [ ] `redaction.json` mit den echten Feldnamen füllen und mit `redact` an Beispielzeilen prüfen.
 - [ ] Mit einem Splunk-Admin klären, ob eine Rolle mit `srchFilter` möglich ist (siehe Grenzen in 4.1).
 - [ ] Enterprise Security im Einsatz? Dann eigene Tools für Notables sinnvoll.

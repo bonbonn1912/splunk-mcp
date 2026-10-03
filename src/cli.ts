@@ -4,6 +4,7 @@ import { fetchCertificate } from "./client.js";
 import { loadConfig, log } from "./config.js";
 import { decryptPassword, encryptPassword, generateSecret } from "./crypto.js";
 import { SplunkMcpError } from "./errors.js";
+import { Redactor } from "./redact.js";
 import { createServer, VERSION } from "./server.js";
 
 const HELP = `splunk-mcp ${VERSION} – read-only MCP server for self-hosted Splunk
@@ -12,6 +13,7 @@ Usage:
   splunk-mcp                         Start the MCP server on stdio (used by Gemini CLI)
   splunk-mcp encrypt [--secret <s>]  Encrypt the Splunk password for settings.json
   splunk-mcp fingerprint [url]       Show the TLS certificate fingerprint of the Splunk server
+  splunk-mcp redact <file.json>      Try a redaction file: reads log lines from stdin, prints them pseudonymised
   splunk-mcp check                   Validate the configuration from the environment variables
   splunk-mcp --help | --version
 `;
@@ -86,6 +88,17 @@ async function cmdFingerprint(args: string[]): Promise<void> {
   process.stdout.write(`"SPLUNK_TLS_FINGERPRINT": "${cert.fingerprint256}",\n`);
 }
 
+async function cmdRedact(args: string[]): Promise<void> {
+  const file = args[0] ?? process.env.SPLUNK_REDACTION_FILE;
+  if (!file) throw new Error("Aufruf: splunk-mcp redact redaction.json < beispiel.log");
+  const redactor = Redactor.fromFile(file);
+  let input = "";
+  process.stdin.setEncoding("utf8");
+  for await (const chunk of process.stdin) input += chunk;
+  const lines = input.split(/\r?\n/);
+  process.stdout.write(redactor.apply(lines).join("\n"));
+}
+
 function cmdCheck(): void {
   const config = loadConfig();
   if (config.passwordEnc && config.secret) decryptPassword(config.passwordEnc, config.secret);
@@ -98,12 +111,17 @@ function cmdCheck(): void {
         : "pinned, ABER SPLUNK_TLS_FINGERPRINT FEHLT"
       : c.tlsMode;
   process.stdout.write(`Konfiguration ist gültig.\n  Splunk:           ${c.url}  (tls=${tlsInfo})\n`);
-  process.stdout.write(`  Gesperrte Hosts:  ${config.blockedHosts.join(", ")}\n  Umgebungen:\n`);
+  process.stdout.write(`  Gesperrte Hosts:  ${config.blockedHosts.join(", ") || "–"}\n`);
+  process.stdout.write(`  Geschützte Hosts: ${config.protectedHosts.join(", ") || "–"}\n`);
+  process.stdout.write(
+    `  Pseudonymisierung: ${config.redactor ? `an (${config.redactor.keys.length} Schlüssel)` : "aus"}\n  Umgebungen:\n`,
+  );
   for (const e of config.environments.values()) {
     process.stdout.write(
       `    ${e.name.padEnd(8)} hosts=${e.hosts.join(",")}  app=${e.app}` +
         `${e.defaultSourcetype ? `  sourcetype=${e.defaultSourcetype}` : ""}` +
-        `${e.excludeActuator ? "  actuator=ausgeblendet" : ""}\n`,
+        `${e.excludeActuator ? "  actuator=ausgeblendet" : ""}` +
+        `${e.isProtected ? "  GESCHÜTZT (nur pseudonymisiert)" : ""}\n`,
     );
   }
 }
@@ -115,7 +133,7 @@ async function cmdServe(): Promise<void> {
   const { server, pool } = createServer(config);
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  log(`v${VERSION} ready. Environments: ${[...config.environments.keys()].join(", ")}. Blocked hosts: ${config.blockedHosts.length}.`);
+  log(`v${VERSION} ready. Environments: ${[...config.environments.keys()].join(", ")}. Blocked hosts: ${config.blockedHosts.length}. Pseudonymisation: ${config.redactor ? "on" : "off"}.`);
   const shutdown = () => {
     pool.closeAll();
     process.exit(0);
@@ -134,6 +152,8 @@ async function main(): Promise<void> {
       return cmdEncrypt(rest);
     case "fingerprint":
       return cmdFingerprint(rest);
+    case "redact":
+      return cmdRedact(rest);
     case "check":
       return cmdCheck();
     case "--version":

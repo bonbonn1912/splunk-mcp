@@ -1,4 +1,5 @@
 import { SplunkMcpError } from "./errors.js";
+import { Redactor } from "./redact.js";
 
 export type TlsMode = "pinned" | "verify" | "insecure";
 
@@ -17,6 +18,10 @@ export interface EnvironmentConfig {
   name: string;
   /** Host patterns of this environment (exact names or wildcards). Never empty. */
   hosts: string[];
+  /** Hosts that must never appear in results of this environment. */
+  blockedHosts: string[];
+  /** True if the environment contains a protected host (only possible with pseudonymisation). */
+  isProtected: boolean;
   app: string;
   defaultSourcetype?: string;
   defaultIndex?: string;
@@ -29,8 +34,12 @@ export interface EnvironmentConfig {
 export interface Config {
   connection: ConnectionConfig;
   environments: Map<string, EnvironmentConfig>;
-  /** Hosts whose data must never be returned (e.g. production). Never empty. */
+  /** Hosts whose data must never be returned (SPLUNK_BLOCKED_HOSTS). */
   blockedHosts: string[];
+  /** Hosts that may only be searched while pseudonymisation is active (SPLUNK_PROTECTED_HOSTS). */
+  protectedHosts: string[];
+  /** Present if SPLUNK_REDACTION_FILE is set; pseudonymises every result. */
+  redactor?: Redactor;
   username?: string;
   passwordEnc?: string;
   secret?: string;
@@ -141,16 +150,23 @@ export function loadConfig(env: Env = process.env): Config {
     caCertPath: clean(env.SPLUNK_CA_CERT),
   };
 
-  // The blocked hosts are mandatory: without them the protection would silently be off.
+  // Optional pseudonymisation. If the file is named but unusable, loading throws: fail closed.
+  const redactionFile = clean(env.SPLUNK_REDACTION_FILE);
+  const redactor = redactionFile ? Redactor.fromFile(redactionFile) : undefined;
+
   const blockedHosts = hostList(env.SPLUNK_BLOCKED_HOSTS, "SPLUNK_BLOCKED_HOSTS");
-  if (blockedHosts.length === 0) {
-    throw new SplunkMcpError("CONFIG_ERROR", "SPLUNK_BLOCKED_HOSTS is not set.", {
-      hint: "Set SPLUNK_BLOCKED_HOSTS to the production host(s) whose data must never be returned, comma separated.",
+  const protectedHosts = hostList(env.SPLUNK_PROTECTED_HOSTS, "SPLUNK_PROTECTED_HOSTS");
+  // The production host must be declared one way or the other: without it the protection would silently be off.
+  if (blockedHosts.length === 0 && protectedHosts.length === 0) {
+    throw new SplunkMcpError("CONFIG_ERROR", "Neither SPLUNK_BLOCKED_HOSTS nor SPLUNK_PROTECTED_HOSTS is set.", {
+      hint: "Name the production host(s): SPLUNK_BLOCKED_HOSTS = never accessible; SPLUNK_PROTECTED_HOSTS = accessible only with pseudonymisation (SPLUNK_REDACTION_FILE).",
     });
   }
-  if (blockedHosts.some((h) => h.replace(/\*/g, "").length < 3)) {
-    throw new SplunkMcpError("CONFIG_ERROR", "Entries in SPLUNK_BLOCKED_HOSTS must contain at least 3 literal characters.");
+  if ([...blockedHosts, ...protectedHosts].some((h) => h.replace(/\*/g, "").length < 3)) {
+    throw new SplunkMcpError("CONFIG_ERROR", "Entries in SPLUNK_BLOCKED_HOSTS / SPLUNK_PROTECTED_HOSTS must contain at least 3 literal characters.");
   }
+  const overlaps = (a: string, b: string) =>
+    globMatch(a, b) || globMatch(b, a) || globMatch(a, b.replace(/\*/g, "")) || globMatch(b, a.replace(/\*/g, ""));
 
   const environments = new Map<string, EnvironmentConfig>();
   for (const [key, raw] of Object.entries(env)) {
@@ -162,18 +178,27 @@ export function loadConfig(env: Env = process.env): Config {
       if (h.replace(/\*/g, "") === "") {
         throw new SplunkMcpError("CONFIG_ERROR", `${key} must not be a bare wildcard.`);
       }
-      for (const b of blockedHosts) {
-        if (globMatch(h, b) || globMatch(b, h) || globMatch(h, b.replace(/\*/g, "")) || globMatch(b, h.replace(/\*/g, ""))) {
-          throw new SplunkMcpError(
-            "CONFIG_ERROR",
-            `${key} ("${h}") overlaps with a blocked host in SPLUNK_BLOCKED_HOSTS. Refusing to start.`,
-          );
-        }
+      if (blockedHosts.some((b) => overlaps(h, b))) {
+        throw new SplunkMcpError(
+          "CONFIG_ERROR",
+          `${key} ("${h}") overlaps with a blocked host in SPLUNK_BLOCKED_HOSTS. Refusing to start.`,
+        );
       }
+    }
+    const touched = protectedHosts.filter((p) => hosts.some((h) => overlaps(h, p)));
+    if (touched.length > 0 && !redactor) {
+      throw new SplunkMcpError(
+        "CONFIG_ERROR",
+        `${key} contains a protected host (SPLUNK_PROTECTED_HOSTS), but pseudonymisation is not configured. Refusing to start.`,
+        { hint: "Set SPLUNK_REDACTION_FILE, or remove this environment." },
+      );
     }
     environments.set(name, {
       name,
       hosts,
+      // Protected hosts that do not belong to this environment are blocked in it.
+      blockedHosts: [...blockedHosts, ...protectedHosts.filter((p) => !touched.includes(p))],
+      isProtected: touched.length > 0,
       app: scoped(env, "SPLUNK_APP", name) ?? "search",
       defaultSourcetype: scoped(env, "SPLUNK_SOURCETYPE", name),
       defaultIndex: scoped(env, "SPLUNK_INDEX", name),
@@ -217,6 +242,8 @@ export function loadConfig(env: Env = process.env): Config {
     connection,
     environments: sorted,
     blockedHosts,
+    protectedHosts,
+    redactor,
     username,
     passwordEnc,
     secret,

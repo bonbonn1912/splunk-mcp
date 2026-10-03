@@ -187,7 +187,7 @@ export async function runSearch(
     offset: 0,
     count: opts.maxRows,
     fields: opts.fields,
-    blockedHosts: config.blockedHosts,
+    blockedHosts: client.env.blockedHosts,
   });
   return { sid, status, ...res };
 }

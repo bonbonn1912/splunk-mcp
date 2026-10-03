@@ -1,0 +1,35 @@
+{
+  "keys": [
+    "firstName",
+    "lastName",
+    "name",
+    "birthDate",
+    "dateOfBirth",
+    "street",
+    "houseNumber",
+    "zipCode",
+    "city",
+    "email",
+    "phone",
+    "mobile",
+    "iban",
+    "bic",
+    "accountHolder",
+    "customerId",
+    "taxId"
+  ],
+  "patterns": {
+    "builtin": [
+      "email",
+      "iban",
+      "phone"
+    ],
+    "custom": [
+      {
+        "name": "kundennummer",
+        "regex": "KD-\\d{8}"
+      }
+    ]
+  },
+  "salt": "hier-einen-langen-zufaelligen-text-eintragen"
+}

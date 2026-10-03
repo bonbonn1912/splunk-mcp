@@ -104,7 +104,11 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
             default_index: e.defaultIndex ?? null,
             excluded: exclusionClauses(e),
           })),
-          meta: { count: config.environments.size, session: pool.connection.sessionState },
+          meta: {
+            count: config.environments.size,
+            session: pool.connection.sessionState,
+            pseudonymised: config.redactor !== undefined,
+          },
           hint: "Every search is limited to the hosts of the chosen environment. Other hosts cannot be searched.",
         },
         config.maxOutputChars,
@@ -124,9 +128,9 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
     args: { query: string; earliest?: string; latest?: string; app?: string; sourcetype?: string; include_excluded?: boolean },
     { client }: Ctx,
   ) {
-    validateQuery(args.query, client.env, config.blockedHosts);
-    if (args.sourcetype) validateQuery(`sourcetype=${quote(args.sourcetype)}`, client.env, config.blockedHosts);
-    const scoped = applyScope(args.query, client.env, config.blockedHosts, {
+    validateQuery(args.query, client.env, config.redactor);
+    if (args.sourcetype) validateQuery(`sourcetype=${quote(args.sourcetype)}`, client.env, config.redactor);
+    const scoped = applyScope(args.query, client.env, {
       sourcetype: args.sourcetype,
       includeExcluded: args.include_excluded,
     });
@@ -294,7 +298,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
         offset: off,
         count: limit,
         fields: args.fields,
-        blockedHosts: config.blockedHosts,
+        blockedHosts: client.env.blockedHosts,
       });
       const more = off + fetched < status.result_count;
       return ok(
@@ -336,8 +340,8 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
     "Check an SPL query without running it: first against this server's rules (event search only, no subsearches or macros, allowed commands), then for Splunk syntax. Use this before an expensive search or after an error.",
     { query: z.string().describe("SPL query to check."), app: appParam },
     async (args, { client }) => {
-      validateQuery(args.query, client.env, config.blockedHosts);
-      const q = applyScope(args.query, client.env, config.blockedHosts).query;
+      validateQuery(args.query, client.env, config.redactor);
+      const q = applyScope(args.query, client.env).query;
       const app = args.app ?? client.env.app;
       const call = (path: string) =>
         client.get<{ commands?: Array<{ command?: string }> }>(`/servicesNS/-/${enc(app)}/${path}`, {
@@ -439,7 +443,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       }
       const limit = clampRows(args.max_rows, 100, config);
       // Built by the server, not by the model: an indexed-field query limited to the environment's hosts.
-      const where = [index ? `index=${quote(index)}` : undefined, hostClause(client.env.hosts), blockedClause(config.blockedHosts)]
+      const where = [index ? `index=${quote(index)}` : undefined, hostClause(client.env.hosts), client.env.blockedHosts.length > 0 ? blockedClause(client.env.blockedHosts) : undefined]
         .filter(Boolean)
         .join(" ");
       const query = `| tstats count as totalCount min(_time) as firstTime max(_time) as lastTime where ${where} by ${field} | sort - totalCount | head ${limit}`;
@@ -481,9 +485,9 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       if (args.index) assertIndexName(args.index);
       const sample = Math.min(args.sample_size ?? 5000, 50000);
       const maxFields = Math.min(args.max_fields ?? 50, 200);
-      if (args.sourcetype) validateQuery(`sourcetype=${quote(args.sourcetype)}`, client.env, config.blockedHosts);
-      if (args.index) validateQuery(`index=${args.index}`, client.env, config.blockedHosts);
-      const scoped = applyScope("", client.env, config.blockedHosts, { index: args.index, sourcetype: args.sourcetype });
+      if (args.sourcetype) validateQuery(`sourcetype=${quote(args.sourcetype)}`, client.env, config.redactor);
+      if (args.index) validateQuery(`index=${args.index}`, client.env, config.redactor);
+      const scoped = applyScope("", client.env, { index: args.index, sourcetype: args.sourcetype });
       const query = `${scoped.query} | head ${sample} | fieldsummary maxvals=5 | sort - count | head ${maxFields}`;
       const earliest = args.earliest ?? "-1h";
       const { rows } = await runSearch(client, config, query, {
@@ -501,6 +505,11 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
           top = [];
         }
         const count = Number(r.count ?? 0);
+        const fieldName = String(r.field ?? "");
+        if (config.redactor?.isKeyName(fieldName) && Array.isArray(top)) {
+          const red = config.redactor;
+          top = (top as unknown[]).map((v) => red.pseudonym(red.keysMentioned(fieldName)[0] ?? fieldName, String(v)));
+        }
         return {
           field: r.field,
           count,
@@ -695,8 +704,8 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
       const spl = String(e.content?.search ?? "");
       // The stored SPL is never dispatched as is: it goes through the same checks
       // and gets the same mandatory host filter as a query written by the model.
-      validateQuery(spl, client.env, config.blockedHosts);
-      const scoped = applyScope(spl, client.env, config.blockedHosts);
+      validateQuery(spl, client.env, config.redactor);
+      const scoped = applyScope(spl, client.env);
       const earliest = args.earliest ?? String(e.content?.["dispatch.earliest_time"] || config.defaultEarliest);
       const latest = args.latest ?? String(e.content?.["dispatch.latest_time"] || "now");
       const limit = clampRows(args.max_rows, 100, config);
@@ -945,7 +954,7 @@ export function registerTools(server: McpServer, config: Config, pool: ClientPoo
         true,
       );
       const all = Array.isArray(rows) ? rows : [];
-      const { rows: data, blocked } = dropBlockedRows(all, config.blockedHosts);
+      const { rows: data, blocked } = dropBlockedRows(all, client.env.blockedHosts);
       const maybeMore = all.length === limit;
       return ok(
         {
@@ -979,6 +988,7 @@ Rules:
 - Every search is automatically limited to the hosts of the chosen environment. This cannot be changed. Do not add host filters yourself.
 - Some hosts are blocked because their data is confidential. If you get BLOCKED_HOST or QUERY_NOT_ALLOWED, do not look for another way to reach that data; tell the user.
 - Write plain event searches: search terms, then pipes (stats, eval, where, rex, timechart, top, ...). No leading pipe, no subsearches in [ ], no macros, no append/join/tstats/inputlookup.
+- Values like [lastName#3fa9c2d1] are pseudonyms for personal data: the same value always gives the same pseudonym, so you can count and correlate them, but the real value is not available. Do not try to recover it. Pseudonymised fields can be filtered and grouped (stats ... by), not copied, renamed or extracted.
 - meta.effective_query shows the SPL that actually ran, including the default sourcetype and exclusion filters.
 - Explore before guessing: splunk_list_sourcetypes shows which logs exist, splunk_get_field_summary shows the available fields.
 - Always use a time range and aggregate in SPL instead of pulling raw events. Keep max_rows small.

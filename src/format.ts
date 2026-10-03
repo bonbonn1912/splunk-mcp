@@ -1,5 +1,6 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { SplunkMcpError } from "./errors.js";
+import type { Redactor } from "./redact.js";
 
 export type Row = Record<string, unknown>;
 
@@ -35,8 +36,15 @@ export interface Payload {
  * would exceed the limit, rows are dropped from the end (never mid-JSON) and
  * the truncation is reported in meta + hint.
  */
+let redactor: Redactor | undefined;
+
+/** Every successful tool result passes through ok(), so this covers all tools. */
+export function setRedactor(r: Redactor | undefined): void {
+  redactor = r;
+}
+
 export function ok(payload: Payload, maxChars: number, truncationHint?: string): CallToolResult {
-  let data = payload.data;
+  let data = redactor ? redactor.apply(payload.data) : payload.data;
   const meta: Record<string, unknown> = { ...(payload.meta ?? {}) };
   let hint = payload.hint;
 

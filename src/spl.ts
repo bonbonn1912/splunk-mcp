@@ -1,5 +1,6 @@
 import { globMatch, type EnvironmentConfig } from "./config.js";
 import { SplunkMcpError } from "./errors.js";
+import type { Redactor } from "./redact.js";
 
 /**
  * Only these commands may follow the base search. They transform or filter the
@@ -115,7 +116,8 @@ function notAllowed(message: string, hint: string): SplunkMcpError {
  *  - balanced quotes and parentheses (so the filter cannot be "closed" early),
  *  - no mention of a blocked host.
  */
-export function validateQuery(query: string, env: EnvironmentConfig, blockedHosts: string[]): void {
+export function validateQuery(query: string, env: EnvironmentConfig, redactor?: Redactor): void {
+  const blockedHosts = env.blockedHosts;
   const trimmed = query.trim();
   if (!trimmed) throw new SplunkMcpError("INVALID_ARGUMENT", "The query is empty.");
 
@@ -153,6 +155,7 @@ export function validateQuery(query: string, env: EnvironmentConfig, blockedHost
       `Only these commands may follow the base search: ${[...ALLOWED_COMMANDS].join(", ")}.`,
     );
   }
+  if (redactor) checkPseudonymisedFields(trimmed, s, redactor);
   if (env.allowedIndexes.length > 0) {
     const allowed = new Set(env.allowedIndexes.map((x) => x.toLowerCase()));
     const wrong = findIndexes(trimmed).filter((i) => !allowed.has(i.toLowerCase()));
@@ -162,6 +165,40 @@ export function validateQuery(query: string, env: EnvironmentConfig, blockedHost
       });
     }
   }
+}
+
+/** Commands that keep field names intact, so a pseudonymised field stays recognisable in the output. */
+const KEEPS_FIELD_NAMES = new Set(["search", "where", "stats", "eventstats", "streamstats", "top", "rare", "dedup", "table", "fields", "sort", "fillnull"]);
+/** Commands that move values to places where the field name is lost. Not usable while pseudonymisation is on. */
+const LOSES_FIELD_NAMES = new Set(["transpose", "untable", "xyseries", "fieldsummary", "contingency"]);
+
+/**
+ * With pseudonymisation on, a blacklisted field must not be copied into a field
+ * of another name (eval x=lastName, rename, rex, "as" ...), because the copy
+ * would no longer be recognised. Filtering and grouping by it stays possible.
+ */
+function checkPseudonymisedFields(query: string, s: Structure, redactor: Redactor): void {
+  const lost = [...new Set(s.pipeCommands.filter((c) => LOSES_FIELD_NAMES.has(c)))];
+  if (lost.length > 0) {
+    throw notAllowed(
+      `Command not allowed while pseudonymisation is active: ${lost.join(", ")}.`,
+      "These commands move values away from their field names. Use stats/table instead.",
+    );
+  }
+  s.pipes.forEach((start, i) => {
+    const end = s.pipes[i + 1] ?? query.length;
+    const segment = query.slice(start + 1, end);
+    const keys = redactor.keysMentioned(segment);
+    if (keys.length === 0) return;
+    const command = s.pipeCommands[i] ?? "";
+    const unquoted = segment.replace(/"(?:\\.|[^"\\])*"/g, '""');
+    if (!KEEPS_FIELD_NAMES.has(command) || /\bas\b/i.test(unquoted)) {
+      throw notAllowed(
+        `The pseudonymised field(s) ${keys.join(", ")} cannot be used in "${command}"${/\bas\b/i.test(unquoted) ? ' with "as"' : ""}.`,
+        "Pseudonymised fields may only be filtered (before the first pipe, or with where/search) and grouped or listed under their own name (stats ... by, top, dedup, table, sort). They cannot be copied, renamed or extracted.",
+      );
+    }
+  });
 }
 
 export function hostClause(hosts: string[]): string {
@@ -206,12 +243,8 @@ export interface ScopedQuery {
  * switched off. The user's terms are wrapped in parentheses so that an OR in
  * them cannot widen the host filter. Call validateQuery() first.
  */
-export function applyScope(
-  rawQuery: string,
-  env: EnvironmentConfig,
-  blockedHosts: string[],
-  opts: ScopeOptions = {},
-): ScopedQuery {
+export function applyScope(rawQuery: string, env: EnvironmentConfig, opts: ScopeOptions = {}): ScopedQuery {
+  const blockedHosts = env.blockedHosts;
   const body = rawQuery.trim().replace(/^search\b\s*/i, "");
   const firstPipe = scan(body).pipes[0] ?? -1;
   const base = (firstPipe === -1 ? body : body.slice(0, firstPipe)).trim();
@@ -223,7 +256,7 @@ export function applyScope(
   const sourcetype = opts.sourcetype ?? env.defaultSourcetype;
   if (sourcetype && !mentions(base, "sourcetype")) prefix.push(`sourcetype=${quote(sourcetype)}`);
   prefix.push(hostClause(env.hosts));
-  prefix.push(blockedClause(blockedHosts));
+  if (blockedHosts.length > 0) prefix.push(blockedClause(blockedHosts));
 
   const excluded = opts.includeExcluded ? [] : exclusionClauses(env);
   const parts = ["search", ...prefix, ...excluded, ...(base ? [`(${base})`] : [])];
